@@ -9,7 +9,7 @@ doesn't anchor you.
 
 ## Identity
 Your agent id is `task:<review id>`. If `$HYRA_AGENT` is not set, pass `--as task:<review id>` on
-every `hyra` call. **Do not** run `hyra task show <target id>` or read the target's summary any other way
+every `hyra` call. If `hyra` is not on your PATH, use `python3 <hyra skill dir>/scripts/hyra`. **Do not** run `hyra task show <target id>` or read the target's summary any other way
 before your blind assessment is recorded.
 
 ## Protocol (in this order)

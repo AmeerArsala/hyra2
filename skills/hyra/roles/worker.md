@@ -10,6 +10,7 @@ honestly and leave a record someone else can check.
 ## Identity
 Your agent id is `task:<id>`. If `$HYRA_AGENT` is not already set (headless runs set it), pass
 `--as task:<id>` on every `hyra` call, e.g. `hyra --as task:7 task note 7 "..."`.
+If `hyra` is not on your PATH, use `python3 <hyra skill dir>/scripts/hyra`.
 
 ## Start
 1. `hyra brief task:<id>`: task spec, mission problem, notes from earlier attempts or wake-ups, inbox.

@@ -8,7 +8,7 @@ Tiers (from the Hyra 2.0 design):
 Entries live in the project (.hyra/books) until synced to the global library
 (~/.hyra/library/books), which is a shared-knowledge sync and therefore requires approval.
 Skills are distilled from entries during retrospectives (.hyra/skills/<name>/SKILL.md) and
-published to the library + ~/.claude/skills only with approval.
+published to the library and linked into every installed harness's skills dir, only with approval.
 """
 from __future__ import annotations
 
@@ -211,25 +211,19 @@ def skill_list(st: Optional[Store]) -> None:
                     print(f"{p.name} ({scope}): {desc[:120]}")
 
 
-def skill_publish(st: Store, name: str, claude_dir: Optional[str]) -> None:
+def skill_publish(st: Store, name: str) -> None:
     src = st.dir / "skills" / name
     if not (src / "SKILL.md").exists():
         raise HyraError(f"no project skill {name}")
     if "\n1.\n" in (src / "SKILL.md").read_text():
         raise HyraError("skill still contains the empty template procedure; finish writing it first")
     if not approval_granted(st, "knowledge-sync", f"skill:{name}"):
-        approval_request(st, "knowledge-sync", f"Publish skill '{name}' to the library and ~/.claude/skills", None, f"skill:{name}")
+        approval_request(st, "knowledge-sync", f"Publish skill '{name}' to the library and all agent harnesses", None, f"skill:{name}")
         return
     dest = library_root() / "skills" / name
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(src, dest)
-    target = Path(claude_dir or os.environ.get("HYRA_CLAUDE_SKILLS", Path.home() / ".claude" / "skills")) / name
-    if target.is_symlink() or not target.exists():
-        if target.is_symlink():
-            target.unlink()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.symlink_to(dest)
-        print(f"published {name} -> {dest} (linked at {target})")
-    else:
-        print(f"published {name} -> {dest}; NOT linking: {target} already exists and is not a symlink")
+    from .install import link_skill
+    print(f"published {name} -> {dest}")
+    print("\n".join(link_skill(dest, name)))

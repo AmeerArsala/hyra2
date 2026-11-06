@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hyra"
+version = "0.2.0"
+description = "Hyra 2.0-style long-horizon agentic research harness: persistent task queue, Research Board, blind review, tiered knowledge, multi-harness agent scheduler"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+hyra = "hyra.cli:main"
+
+[tool.setuptools]
+packages = ["hyra"]

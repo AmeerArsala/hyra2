@@ -114,18 +114,20 @@ def needs_approval(st: Store, resources: dict) -> list[str]:
 
 def task_add(st: Store, mission: str, kind: str, title: str, spec: str, priority: int,
              deps: list[int], resources: dict, model: Optional[str], force_approval: bool,
-             review_of: Optional[int] = None) -> int:
+             review_of: Optional[int] = None, harness: Optional[str] = None) -> int:
     m = st.mission(mission)
     if m["status"] == "closed":
         raise HyraError(f"mission {mission} is closed")
     for d in deps:
         st.task(d)
+    if harness:
+        st.harness_cmd(harness)  # validate
     gated = needs_approval(st, resources)
     status = "awaiting_approval" if (gated or force_approval) else "queued"
-    tid = st.x("""INSERT INTO tasks(mission,kind,title,spec,status,priority,deps,resources,model,review_of,created,updated)
-                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+    tid = st.x("""INSERT INTO tasks(mission,kind,title,spec,status,priority,deps,resources,model,harness,review_of,created,updated)
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                mission, kind, title, spec, status, priority, json.dumps(deps), json.dumps(resources),
-               model, review_of, now(), now())
+               model, harness, review_of, now(), now())
     if status == "awaiting_approval":
         what = f"Run T{tid} '{title}' with resources {json.dumps(resources)}"
         aid = st.x("INSERT INTO approvals(kind,what,task,requested_by,created) VALUES (?,?,?,?,?)",
@@ -215,7 +217,7 @@ def task_show(st: Store, tid: int) -> None:
     rv = st.one("SELECT * FROM reviews WHERE review_task=?", tid)
     print(f"# T{tid} [{t['status']}] {t['kind']} in mission '{t['mission']}' (priority {t['priority']})")
     print(f"title: {t['title']}")
-    for k in ["model", "worker", "claimed_at", "wake_at", "wake_reason", "attempts"]:
+    for k in ["harness", "model", "worker", "claimed_at", "wake_at", "wake_reason", "attempts"]:
         if t[k]:
             print(f"{k}: {t[k]}")
     if t["deps"] != "[]":
@@ -479,7 +481,8 @@ def approval_granted(st: Store, kind: str, ref: str) -> bool:
 
 
 # ---------------------------------------------------------------- reviews
-def review_request(st: Store, target: int, focus: str, model: Optional[str], priority: Optional[int]) -> None:
+def review_request(st: Store, target: int, focus: str, model: Optional[str], priority: Optional[int],
+                   harness: Optional[str] = None) -> None:
     t = st.task(target)
     if t["status"] != "done":
         raise HyraError(f"T{target} is {t['status']}; review completed work")
@@ -493,7 +496,8 @@ def review_request(st: Store, target: int, focus: str, model: Optional[str], pri
     if focus:
         spec += f"\n\nReview focus requested by {me()}: {focus}"
     rid = task_add(st, t["mission"], "review", f"Review T{target}: {t['title']}", spec,
-                   priority if priority is not None else t["priority"] + 5, [], {}, model, False, review_of=target)
+                   priority if priority is not None else t["priority"] + 5, [], {}, model, False, review_of=target,
+                   harness=harness)
     st.x("INSERT INTO reviews(review_task,target_task,created,updated) VALUES (?,?,?,?)", rid, target, now(), now())
 
 

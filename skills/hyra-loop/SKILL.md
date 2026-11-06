@@ -3,6 +3,8 @@ name: hyra-loop
 description: Hyra 1.0 recursive improvement loop for performance-driven problems with a computable score (speedups, bounds/constructions, benchmark metrics, heuristics). Maintains an Experience Bank of scored solutions, assembles inspiration bundles, proposes improved solutions in parallel, and upgrades the evaluator when it becomes the bottleneck (bilevel loop). Use when a task or sub-problem can be scored automatically.
 ---
 
+> Requires the `hyra` skill (its CLI: `hyra`, or `python3 <hyra skill dir>/scripts/hyra`).
+
 # Hyra loop (Experience Bank)
 
 A minimalist loop for problems with clear evaluation criteria: keep proposing, scoring and learning
@@ -28,7 +30,7 @@ for a score-driven sub-problem. It isn't the whole research process.
   a recurring failure, and a bold new direction.
 - **Proposal step:** for each inspiration, write a new solution dir (copy the parent, then change it)
   and `hyra eb submit <name> <dir> --parent <sid> --note "<idea in one line>"`. To go in parallel,
-  dispatch several `hyra-worker` subagents, each with a different inspiration and the same bank name.
+  dispatch several workers (subagents, or tasks run via `hyra run`), each with a different inspiration and the same bank name.
 - Record in a task note or memory which ideas helped and which didn't, so the next context step
   doesn't repeat dead ends.
 - Stop when the target is met, the budget is spent, or several rounds bring no improvement. Then

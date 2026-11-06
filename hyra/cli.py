@@ -13,9 +13,8 @@ import sys
 from pathlib import Path
 
 from . import books, core, eb
-from .store import HyraError, Store, die
+from .store import HyraError, Store, die, skill_dir
 
-GUIDE = Path(__file__).resolve().parent.parent / "claude" / "skills" / "hyra" / "SKILL.md"
 
 
 def _ids(s: str) -> list[int]:
@@ -40,6 +39,8 @@ def build() -> argparse.ArgumentParser:
                    "default $HYRA_AGENT or 'overall'")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    s = sub.add_parser("setup", help="install hyra skills into every agent harness on this machine + CLI on PATH")
+    s.add_argument("--bin-dir"); s.add_argument("--uninstall", action="store_true")
     s = sub.add_parser("init", help="create .hyra/ in the current directory")
     s.add_argument("--project", default="")
     s.add_argument("--goal", default="")
@@ -73,6 +74,7 @@ def build() -> argparse.ArgumentParser:
     s.add_argument("--priority", type=int, default=50); s.add_argument("--after", default="", help="dependency ids, e.g. 3,4")
     s.add_argument("--resource", action="append", help="e.g. gpu=2 (repeatable)")
     s.add_argument("--model", help="model for this worker (diversity of perspectives)")
+    s.add_argument("--harness", help="agent harness for headless runs: claude, codex, agy, opencode, amp, or custom")
     s.add_argument("--needs-approval", action="store_true")
     s = t.add_parser("list"); s.add_argument("--status"); s.add_argument("--mission")
     s = t.add_parser("show"); s.add_argument("id", type=_tid)
@@ -121,6 +123,7 @@ def build() -> argparse.ArgumentParser:
     r = sub.add_parser("review", help="independent blind review").add_subparsers(dest="sub", required=True)
     s = r.add_parser("request"); s.add_argument("target", type=_tid); s.add_argument("--focus", default="")
     s.add_argument("--model"); s.add_argument("--priority", type=int)
+    s.add_argument("--harness", help="e.g. review Claude's work with codex for an independent perspective")
     s = r.add_parser("evidence"); s.add_argument("id", type=_tid)
     s = r.add_parser("blind"); s.add_argument("id", type=_tid); s.add_argument("--notes", required=True)
     s = r.add_parser("claim"); s.add_argument("id", type=_tid)
@@ -149,11 +152,11 @@ def build() -> argparse.ArgumentParser:
     s = k.add_parser("sync", help="copy a project entry to the shared library (needs approval)"); s.add_argument("id")
 
     # skills
-    sk = sub.add_parser("skill", help="distill reusable methods into Claude Code skills").add_subparsers(dest="sub", required=True)
+    sk = sub.add_parser("skill", help="distill reusable methods into Agent Skills (SKILL.md)").add_subparsers(dest="sub", required=True)
     s = sk.add_parser("new"); s.add_argument("name"); s.add_argument("--description", required=True)
     s.add_argument("--from-books", default="")
     sk.add_parser("list")
-    s = sk.add_parser("publish"); s.add_argument("name"); s.add_argument("--claude-skills-dir")
+    s = sk.add_parser("publish"); s.add_argument("name")
 
     # experience banks
     e = sub.add_parser("eb", help="Hyra 1.0 score-driven loop (Experience Bank) as a tool").add_subparsers(dest="sub", required=True)
@@ -173,6 +176,8 @@ def build() -> argparse.ArgumentParser:
     s = sub.add_parser("run", help="scheduler: launch headless Mission/Worker sessions and keep them moving")
     s.add_argument("--max-workers", type=int); s.add_argument("--once", action="store_true")
     s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--task", type=_tid, help="launch just this task in a fresh headless session and wait for it")
+    s.add_argument("--harness", help="override the harness for this run"); s.add_argument("--model")
     return p
 
 
@@ -195,8 +200,12 @@ def dispatch(a) -> None:
         st = Store.init(Path.cwd(), a.project or Path.cwd().name, a.goal)
         print(f"initialized Hyra project at {st.dir}\nedit {st.dir/'config.json'} for resources, approval rules and the agent command")
         return
+    if a.cmd == "setup":
+        from .install import setup
+        setup(a.bin_dir, a.uninstall)
+        return
     if a.cmd == "guide":
-        print(GUIDE.read_text() if GUIDE.exists() else "guide not found")
+        print((skill_dir() / "SKILL.md").read_text())
         return
     if a.cmd == "books" and a.sub in ("search", "show"):
         try:
@@ -230,7 +239,7 @@ def dispatch(a) -> None:
     elif c == "task":
         if s == "add":
             core.task_add(st, a.mission, a.kind, a.title, a.spec, a.priority, _ids(a.after), _res(a.resource),
-                          a.model, a.needs_approval)
+                          a.model, a.needs_approval, harness=a.harness)
         elif s == "list":
             core.task_list(st, a.status, a.mission)
         elif s == "show":
@@ -277,7 +286,7 @@ def dispatch(a) -> None:
         else:
             core.approval_decide(st, a.id, s == "grant", a.by, a.note)
     elif c == "review":
-        {"request": lambda: core.review_request(st, a.target, a.focus, a.model, a.priority),
+        {"request": lambda: core.review_request(st, a.target, a.focus, a.model, a.priority, a.harness),
          "evidence": lambda: core.review_evidence(st, a.id),
          "blind": lambda: core.review_blind(st, a.id, a.notes),
          "claim": lambda: core.review_claim(st, a.id),
@@ -305,7 +314,7 @@ def dispatch(a) -> None:
         if s == "new":
             books.skill_new(st, a.name, a.description, [x for x in a.from_books.split(",") if x])
         elif s == "publish":
-            books.skill_publish(st, a.name, a.claude_skills_dir)
+            books.skill_publish(st, a.name)
     elif c == "eb":
         if s == "init":
             eb.eb_init(st, a.name, a.evaluator, a.task, a.direction, a.timeout)
@@ -325,7 +334,8 @@ def dispatch(a) -> None:
                 print(f"{cfg['name']}: {cfg['task'][:80]} (evaluator {cfg['evaluator']}, {cfg['direction']})")
     elif c == "run":
         from .runner import Runner
-        Runner(st, a.max_workers, a.dry_run).loop(a.once or a.dry_run)
+        r = Runner(st, a.max_workers, a.dry_run, a.harness, a.model)
+        r.run_one(a.task) if a.task else r.loop(a.once or a.dry_run)
 
 
 if __name__ == "__main__":

@@ -17,10 +17,12 @@ import signal
 import subprocess
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from .core import fits, ready, task_claim, usage
-from .store import Store, is_due, now
+from .store import Store, is_due, now, skill_dir
+
 
 WORKER_PROMPT = """You are a Hyra Worker on task T{tid} in the Hyra project at {root}.
 Begin with `hyra brief task:{tid}` and follow your Worker protocol.
@@ -29,14 +31,31 @@ Before you exit you MUST leave the task in a terminal or parked state with exact
 or `hyra task sleep {tid} --until ... --reason ...`."""
 
 REVIEWER_PROMPT = """You are a Hyra Review Worker on review task T{tid} in the Hyra project at {root}.
-Begin with `hyra brief task:{tid}`, then follow the blind review protocol exactly
+Begin with `hyra brief task:{tid}`, then follow your blind review protocol exactly
 (evidence -> blind assessment -> claim -> verdict). Finish with `hyra review verdict {tid} ...`."""
 
 MISSION_PROMPT = """You are the Hyra Mission agent for mission '{slug}' in the Hyra project at {root}.
 You were woken because: {reason}.
-Begin with `hyra brief mission:{slug}` and follow your Mission protocol: read results, request reviews
-for load-bearing claims, update your memory, queue the next tasks, and set your next wake-up
+Begin with `hyra brief mission:{slug}` and follow your Mission protocol: read results, request
+reviews for load-bearing claims, update your memory, queue the next tasks, and set your next wake-up
 (`hyra mission wake {slug} --at ... --reason ...`) before exiting. Do not run long experiments yourself."""
+
+
+def role_text(role: str) -> str:
+    """The role protocol without its YAML frontmatter (which exists for Claude Code subagents)."""
+    text = (skill_dir() / "roles" / f"{role}.md").read_text()
+    if text.startswith("---\n"):
+        text = text[text.index("\n---\n", 4) + 5:]
+    return text.strip()
+
+
+def compose(header: str, role: str) -> str:
+    return f"{header}\n\nThe `hyra` CLI is on your PATH. Your role protocol follows.\n\n{role_text(role)}\n"
+
+
+def claude_agent_installed(role: str) -> bool:
+    claude = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+    return (claude / "agents" / f"hyra-{role}.md").exists()
 
 
 def _alive(pid: Optional[int]) -> bool:
@@ -49,39 +68,52 @@ def _alive(pid: Optional[int]) -> bool:
         return False
 
 
-def _cmd(st: Store, agent: str, model: Optional[str], prompt: str) -> list[str]:
-    out, skip = [], False
-    tpl = st.config["agent_cmd"]
+def _cmd(tpl: list[str], model: Optional[str], agent: Optional[str], prompt: str) -> list[str]:
+    """Fill a harness template. Optional placeholders ({model}, {agent}) are dropped together with
+    the flag in front of them when they have no value."""
+    vals = {"{model}": model, "{agent}": agent}
+    out = []
     for i, part in enumerate(tpl):
-        if skip:
-            skip = False
+        nxt = tpl[i + 1] if i + 1 < len(tpl) else None
+        if nxt in vals and not vals[nxt]:
             continue
-        if part == "--model" and i + 1 < len(tpl) and tpl[i + 1] == "{model}" and not model:
-            skip = True
+        if part in vals and not vals[part]:
             continue
-        out.append(part.replace("{agent}", agent).replace("{model}", model or "").replace("{prompt}", prompt))
+        out.append(part.replace("{model}", model or "").replace("{agent}", agent or "").replace("{prompt}", prompt))
     return out
 
 
 class Runner:
-    def __init__(self, st: Store, max_workers: Optional[int], dry_run: bool):
+    def __init__(self, st: Store, max_workers: Optional[int], dry_run: bool,
+                 harness: Optional[str] = None, model: Optional[str] = None):
         self.st = st
         self.dry = dry_run
+        self.harness = harness
+        self.model = model
         self.me = f"runner:{os.getpid()}"
         self.procs: dict[int, tuple[subprocess.Popen, int, Optional[int], Optional[str]]] = {}
         if max_workers is not None:
             st.config.setdefault("resources", {})["workers"] = max_workers
 
     # -------------------------------------------------------------- launching
-    def _launch(self, agent_def: str, agent_id: str, role: str, prompt: str, model: Optional[str],
+    def _launch(self, agent_id: str, role: str, header: str, model: Optional[str], harness: Optional[str],
                 task: Optional[int], mission: Optional[str]) -> None:
-        cmd = _cmd(self.st, agent_def, model, prompt)
+        harness = self.harness or harness or self.st.config.get("harness", "claude")
+        model = self.model or model
+        tpl = self.st.harness_cmd(harness)
+        # Harnesses with native agent definitions (Claude Code: --agent hyra-<role>) load the role as
+        # the session's own system prompt. Everyone else gets the protocol embedded in the prompt.
+        native = "{agent}" in tpl and claude_agent_installed(role)
+        prompt = header + "\n\nThe `hyra` CLI is on your PATH." if native else compose(header, role)
+        cmd = _cmd(tpl, model, f"hyra-{role}" if native else None, prompt)
         if self.dry:
-            print(f"[dry-run] would launch {agent_id}: {' '.join(c if ' ' not in c else repr(c[:60] + '…') for c in cmd)}")
+            print(f"[dry-run] would launch {agent_id} via {harness}: "
+                  f"{' '.join(c if ' ' not in c else repr(c[:50] + '…') for c in cmd)}")
             return
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         log = self.st.dir / "logs" / f"{agent_id.replace(':', '_')}-{stamp}.log"
-        env = dict(os.environ, HYRA_PROJECT=str(self.st.root), HYRA_AGENT=agent_id, HYRA_ROLE=role)
+        env = dict(os.environ, HYRA_PROJECT=str(self.st.root), HYRA_AGENT=agent_id, HYRA_ROLE=role,
+                   PATH=f"{skill_dir() / 'scripts'}{os.pathsep}{os.environ.get('PATH', '')}")
         if task is not None:
             env["HYRA_TASK"] = str(task)
         fh = open(log, "w")
@@ -92,7 +124,7 @@ class Runner:
         if task is not None:
             self.st.set_task(task, pid=p.pid)
         self.procs[p.pid] = (p, sid, task, mission)
-        print(f"{now()} launched {agent_id} pid {p.pid} log {log}")
+        print(f"{now()} launched {agent_id} via {harness} pid {p.pid} log {log}")
 
     # -------------------------------------------------------------- reaping
     def _overdue(self, sid: int, task: Optional[int]) -> Optional[str]:
@@ -189,8 +221,8 @@ class Runner:
                 break
             if not self.dry:
                 self.st.x("UPDATE missions SET wake_at=NULL WHERE slug=?", slug)
-            self._launch("hyra-mission", f"mission:{slug}", "mission",
-                         MISSION_PROMPT.format(slug=slug, root=self.st.root, reason=reason), None, None, slug)
+            self._launch(f"mission:{slug}", "mission",
+                         MISSION_PROMPT.format(slug=slug, root=self.st.root, reason=reason), None, None, None, slug)
             live_missions += 1
         if self.dry:
             used = usage(self.st)
@@ -211,11 +243,23 @@ class Runner:
     def _launch_task(self, t) -> None:
         tid = t["id"]
         if t["kind"] == "review":
-            self._launch("hyra-reviewer", f"task:{tid}", "reviewer",
-                         REVIEWER_PROMPT.format(tid=tid, root=self.st.root), t["model"], tid, None)
+            self._launch(f"task:{tid}", "reviewer", REVIEWER_PROMPT.format(tid=tid, root=self.st.root),
+                         t["model"], t["harness"], tid, None)
         else:
-            self._launch("hyra-worker", f"task:{tid}", "worker",
-                         WORKER_PROMPT.format(tid=tid, root=self.st.root), t["model"], tid, None)
+            self._launch(f"task:{tid}", "worker", WORKER_PROMPT.format(tid=tid, root=self.st.root),
+                         t["model"], t["harness"], tid, None)
+
+    def run_one(self, tid: int) -> None:
+        """Dispatch one specific task to a fresh headless session and wait (e.g. a cross-harness review)."""
+        if self.dry:
+            self._launch_task(self.st.task(tid))
+            return
+        task_claim(self.st, self.me, tid)
+        self._launch_task(self.st.task(tid))
+        while self.procs:
+            time.sleep(2)
+            self.reap()
+        print(f"T{tid} is now {self.st.task(tid)['status']}")
 
     def loop(self, once: bool) -> None:
         stop = {"flag": False}

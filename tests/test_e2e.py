@@ -8,7 +8,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-HYRA = str(Path(__file__).resolve().parent.parent / "bin" / "hyra")
+HYRA = str(Path(__file__).resolve().parent.parent / "skills" / "hyra" / "scripts" / "hyra")
 
 
 class E2E(unittest.TestCase):
@@ -17,7 +17,8 @@ class E2E(unittest.TestCase):
         self.root = Path(self.tmp.name) / "proj"
         self.root.mkdir()
         self.env = dict(os.environ, HYRA_LIBRARY=str(Path(self.tmp.name) / "lib"),
-                        HYRA_CLAUDE_SKILLS=str(Path(self.tmp.name) / "claude-skills"))
+                        HYRA_SKILL_DIRS=os.pathsep.join(str(Path(self.tmp.name) / d) for d in ("agents-skills", "claude-skills")))
+        self.env["CLAUDE_CONFIG_DIR"] = str(Path(self.tmp.name) / "claude-home")  # no hyra agents installed
         for k in ("HYRA_AGENT", "HYRA_ROLE", "HYRA_TASK", "HYRA_PROJECT"):
             self.env.pop(k, None)
 
@@ -114,7 +115,8 @@ class E2E(unittest.TestCase):
         aid = out.split("approval A")[1].split()[0]
         self.h("approval", "grant", aid)
         self.h("skill", "publish", "lr-warmup")
-        self.assertTrue((Path(self.env["HYRA_CLAUDE_SKILLS"]) / "lr-warmup/SKILL.md").exists())
+        for d in ("agents-skills", "claude-skills"):  # linked into every harness dir
+            self.assertTrue((Path(self.tmp.name) / d / "lr-warmup/SKILL.md").exists())
 
     def test_experience_bank(self):
         self.h("init")
@@ -144,18 +146,31 @@ class E2E(unittest.TestCase):
         self.h("init")
         self.h("mission", "new", "m1", "--title", "t", "--problem", "p")
         self.h("task", "add", "--mission", "m1", "--title", "a", "--spec", "s", "--model", "sonnet")
-        self.h("task", "add", "--mission", "m1", "--title", "b", "--spec", "s")
+        self.h("task", "add", "--mission", "m1", "--title", "b", "--spec", "s", "--harness", "codex")
+        self.h("task", "add", "--mission", "m1", "--title", "c", "--spec", "s", "--harness", "nope", ok=False)
         out = self.h("run", "--dry-run")
-        self.assertIn("would launch mission:m1", out)
-        self.assertIn("would launch task:1", out)
-        self.assertIn("--model sonnet", out)
-        self.assertIn("would launch task:2", out)
+        self.assertIn("would launch mission:m1 via claude", out)
+        self.assertIn("would launch task:1 via claude: claude -p --permission-mode auto --model sonnet", out)
+        self.assertIn("would launch task:2 via codex: codex exec", out)
+        self.assertNotIn("-m '", out.split("task:2")[1])  # no model -> -m flag dropped
+        self.assertIn("via agy: agy -p --dangerously-skip-permissions", self.h("run", "--dry-run", "--task", "2", "--harness", "agy"))
+        self.assertNotIn("--agent", out)  # Claude subagents not installed -> role embedded in prompt instead
+        # With the Claude Code agent definitions installed, claude sessions load the role natively.
+        agents = Path(self.env["CLAUDE_CONFIG_DIR"]) / "agents"
+        agents.mkdir(parents=True)
+        for r in ("mission", "worker", "reviewer"):
+            (agents / f"hyra-{r}.md").write_text("---\nname: x\n---\n")
+        out = self.h("run", "--dry-run")
+        self.assertIn("claude -p --permission-mode auto --agent hyra-worker --model sonnet", out)
+        self.assertIn("--agent hyra-mission", out)
+        self.assertNotIn("--agent", out.split("task:2")[1])  # codex has no native agents
         self.assertIn("[queued]", self.h("task", "list"))  # dry run claims nothing
 
     def test_runner_requeues_dead_worker(self):
         self.h("init")
         cfg = json.loads((self.root / ".hyra/config.json").read_text())
-        cfg["agent_cmd"] = ["true", "{agent}", "{prompt}"]  # a "worker" that exits immediately
+        cfg["harness"] = "fake"
+        cfg["harness_cmds"] = {"fake": ["true", "{prompt}"]}  # a "worker" that exits immediately
         cfg["max_attempts"] = 2
         (self.root / ".hyra/config.json").write_text(json.dumps(cfg))
         self.h("mission", "new", "m1", "--title", "t", "--problem", "p")
@@ -169,14 +184,49 @@ class E2E(unittest.TestCase):
         self.h("init")
         cfg = json.loads((self.root / ".hyra/config.json").read_text())
         script = (f'"{sys.executable}" "{HYRA}" task complete $HYRA_TASK --summary ok --no-evidence; '
-                  'sleep 600 # {agent} {prompt}')
-        cfg.update(agent_cmd=["bash", "-c", script], settle_grace_seconds=1, poll_seconds=1, max_missions_running=0)
+                  'sleep 600 # {prompt}')
+        cfg.update(harness="fake", harness_cmds={"fake": ["bash", "-c", script]}, settle_grace_seconds=1,
+                   poll_seconds=1, max_missions_running=0)
         (self.root / ".hyra/config.json").write_text(json.dumps(cfg))
         self.h("mission", "new", "m1", "--title", "t", "--problem", "p")
         self.h("task", "add", "--mission", "m1", "--title", "a", "--spec", "s")
         out = self.h("run", "--once")
         self.assertIn("stopping pid", out)
         self.assertIn("[done]", self.h("task", "show", "1"))
+
+    def test_any_harness_gets_role_protocol_and_cli(self):
+        """A generic harness receives the full role protocol in its prompt and finds `hyra` on PATH."""
+        self.h("init")
+        cfg = json.loads((self.root / ".hyra/config.json").read_text())
+        script = 'printf "%s" "$0" > prompt.txt; hyra task complete $HYRA_TASK --summary ok --evidence prompt.txt'
+        cfg.update(harness_cmds={"generic": ["bash", "-c", script, "{prompt}"]}, max_missions_running=0)
+        (self.root / ".hyra/config.json").write_text(json.dumps(cfg))
+        self.h("mission", "new", "m1", "--title", "t", "--problem", "p")
+        self.h("task", "add", "--mission", "m1", "--title", "a", "--spec", "s", "--harness", "generic")
+        self.assertIn("T1 is now done", self.h("run", "--task", "1"))
+        prompt = (self.root / "prompt.txt").read_text()
+        self.assertIn("Hyra Worker on task T1", prompt)
+        self.assertIn("## Integrity rules", prompt)  # worker role body embedded
+        self.assertNotIn("name: hyra-worker", prompt)  # Claude frontmatter stripped
+        self.h("review", "request", "1", "--harness", "generic")
+        self.assertIn("harness: generic", self.h("task", "show", "2"))
+
+    def test_setup_links_every_harness(self):
+        home = Path(self.tmp.name) / "home"
+        for d in (".claude", ".gemini/antigravity-cli", ".config/opencode"):
+            (home / d).mkdir(parents=True)
+        env = {"HOME": str(home), "HYRA_SKILL_DIRS": "", "XDG_CONFIG_HOME": str(home / ".config"),
+               "CLAUDE_CONFIG_DIR": str(home / ".claude"), "HYRA_BIN_DIR": str(home / "bin")}
+        self.h("setup", env=env)
+        for d in (".agents/skills", ".claude/skills", ".gemini/antigravity-cli/skills", ".config/opencode/skills"):
+            for sk in ("hyra", "hyra-loop", "hyra-prover", "hyra-retro"):
+                self.assertTrue((home / d / sk / "SKILL.md").exists(), f"{d}/{sk}")
+        self.assertFalse((home / ".cursor").exists())  # harnesses that aren't installed are left alone
+        self.assertTrue((home / ".claude/agents/hyra-worker.md").exists())
+        self.assertTrue((home / "bin/hyra").exists())
+        self.h("setup", "--uninstall", env=env)
+        self.assertFalse((home / ".gemini/antigravity-cli/skills/hyra").exists())
+        self.assertFalse((home / "bin/hyra").exists())
 
 
 if __name__ == "__main__":

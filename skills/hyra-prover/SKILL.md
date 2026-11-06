@@ -3,6 +3,8 @@ name: hyra-prover
 description: HyProver-style workflow for proofs in pure mathematics on the Hyra harness — literature search, problem reformulation, intermediate conjectures, proof Workers, and independent fresh-context review, with reviewed lemmas accumulated in shared research notes as premises. Use when the goal is to prove (or disprove) a mathematical statement.
 ---
 
+> Requires the `hyra` skill (its CLI: `hyra`, or `python3 <hyra skill dir>/scripts/hyra`).
+
 # HyProver workflow
 
 Organize mathematical exploration the way a careful mathematician does. Spend tokens on promising,

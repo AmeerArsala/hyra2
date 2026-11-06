@@ -34,10 +34,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "resources": {"workers": 4, "gpu": 0},
     # A task requesting >= this amount of a resource needs human approval before it can run.
     "approval_rules": {"gpu": 1},
-    # Headless session command used by `hyra run`. {agent}, {model}, {prompt} are substituted;
-    # the "--model" pair is dropped when a task has no model.
-    "agent_cmd": ["claude", "-p", "--permission-mode", "auto", "--agent", "{agent}",
-                  "--model", "{model}", "{prompt}"],
+    # Agent harness used by `hyra run` for headless sessions, unless a task sets its own (--harness).
+    # Commands in "harness_cmds" override/extend HARNESS_PRESETS. {prompt} and {model} are
+    # substituted; the flag right before "{model}" is dropped when no model is set.
+    "harness": "claude",
+    "harness_cmds": {},
     "max_missions_running": 2,
     "max_attempts": 2,
     "poll_seconds": 30,
@@ -48,6 +49,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Optional prefix for Experience Bank evaluation, e.g. ["docker", "run", "--rm", ...].
     "eb_sandbox_prefix": [],
     "evidence_copy_max_bytes": 2_000_000,
+}
+
+# Headless invocations per harness. The role protocol is embedded in {prompt}, so no
+# harness-specific agent definitions are needed. Permission flags are deliberately autonomous
+# (unattended workers can't answer prompts); override per project in config "harness_cmds".
+HARNESS_PRESETS: dict[str, list[str]] = {
+    # Claude Code: role loaded natively as the subagent definition (~/.claude/agents/hyra-<role>.md,
+    # installed by `hyra setup`); if that file is missing, "--agent {agent}" is dropped and the
+    # role is embedded in the prompt like for every other harness.
+    "claude": ["claude", "-p", "--permission-mode", "auto", "--agent", "{agent}", "--model", "{model}", "{prompt}"],
+    "codex": ["codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check",
+              "-m", "{model}", "{prompt}"],
+    # Antigravity CLI (Google's successor to Gemini CLI); Go-style flags must precede the prompt.
+    "agy": ["agy", "-p", "--dangerously-skip-permissions", "--model", "{model}", "{prompt}"],
+    "opencode": ["opencode", "run", "-m", "{model}", "{prompt}"],
+    "amp": ["amp", "--dangerously-allow-all", "-x", "{prompt}"],
 }
 
 SCHEMA = """
@@ -122,6 +139,20 @@ def is_due(ts: Optional[str]) -> bool:
     return bool(ts) and datetime.fromisoformat(ts) <= datetime.now(timezone.utc)
 
 
+def skill_dir() -> Path:
+    """The `hyra` skill folder (SKILL.md, roles/, scripts/hyra). In a checkout it sits next to this
+    package; for an installed package, fall back to wherever the skill was installed."""
+    home = Path.home()
+    cands = [Path(__file__).resolve().parent.parent / "skills" / "hyra",
+             Path(os.environ.get("HYRA_SKILL_DIR", "/nonexistent")),
+             home / ".agents" / "skills" / "hyra",
+             Path(os.environ.get("CLAUDE_CONFIG_DIR", home / ".claude")) / "skills" / "hyra"]
+    for c in cands:
+        if (c / "roles" / "worker.md").exists():
+            return c.resolve()
+    raise HyraError("can't find the hyra skill folder (roles/*.md); set HYRA_SKILL_DIR")
+
+
 def library_root() -> Path:
     return Path(os.environ.get("HYRA_LIBRARY", Path.home() / ".hyra" / "library"))
 
@@ -149,7 +180,17 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=30000")
         self.db.executescript(SCHEMA)
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(tasks)")}
+        if "harness" not in cols:
+            self.db.execute("ALTER TABLE tasks ADD COLUMN harness TEXT")
         self.config = self._load_config()
+
+    def harness_cmd(self, name: str) -> list[str]:
+        cmds = dict(HARNESS_PRESETS, **self.config.get("harness_cmds", {}))
+        if name not in cmds:
+            raise HyraError(f"unknown harness {name!r}; known: {', '.join(sorted(cmds))} "
+                            "(add one under \"harness_cmds\" in .hyra/config.json)")
+        return cmds[name]
 
     # ---- construction -------------------------------------------------
     @classmethod

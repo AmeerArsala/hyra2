@@ -1,7 +1,9 @@
 ---
 name: hyra-retro
-description: Hyra project retrospective — distill what a mission or project learned into evidence-backed Books entries (observation / verified / convention), automated checks, and reusable Claude Code skills, so later projects skip the same trial and error. Use when a Hyra mission closes, after a costly failure, or when the user asks to consolidate lessons.
+description: Hyra project retrospective — distill what a mission or project learned into evidence-backed Books entries (observation / verified / convention), automated checks, and reusable Agent Skills (SKILL.md), so later projects skip the same trial and error. Use when a Hyra mission closes, after a costly failure, or when the user asks to consolidate lessons.
 ---
+
+> Requires the `hyra` skill (its CLI: `hyra`, or `python3 <hyra skill dir>/scripts/hyra`).
 
 # Hyra retrospective (continual learning)
 
@@ -40,7 +42,7 @@ scratch", "debugging loss spikes", "verifying a kernel against a reference"):
 2. Edit `.hyra/skills/<name>/SKILL.md` into a procedure another agent can follow cold: when to use it,
    numbered steps, checks and pitfalls, and provenance (Books ids / tasks). Keep it under ~150 lines.
 3. `hyra skill publish <name>` → approval request; once granted, re-run to install it into
-   `~/.claude/skills` so every future session can use it.
+   the shared skills directory so every harness can use it in future sessions.
 Existing skills that the retro shows to be wrong or incomplete should be revised the same way.
 Skills are tools too, and they keep improving through use.
 
