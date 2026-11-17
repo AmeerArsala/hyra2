@@ -56,22 +56,28 @@ def init_run(st: Store, no_ledger: bool, say=print) -> None:
 
 
 def after_up(backup_remote: Optional[str], say=print) -> None:
-    """The last step of `hyra server up`: a private git remote for the ledger's backups (asked once, in a terminal)."""
+    """The last step of every `hyra server up`: the git remote for the ledger's backups, then a backup that pushes to it.
+    In a terminal it always asks, showing the saved remote (Enter keeps it), so re-running `up` is how you fix or change it.
+    Not in a terminal (an agent): it uses the saved remote, or tells you what's missing."""
     ucfg = doctor.user_config_path()
     have = (doctor._read(ucfg).get("ledger_backup_remote") or "") if ucfg.exists() else ""
-    if backup_remote is None and not have:
+    if backup_remote is None:
         if _tty():
+            shown = f"[{have}; Enter keeps it]" if have else "[blank to skip]"
             try:
-                backup_remote = input("Git remote to back the ledger up to (a PRIVATE repo URL; blank to skip): ").strip()
+                backup_remote = input(f"Git remote to back the ledger up to (a PRIVATE repo URL) {shown}: ").strip() or have
             except EOFError:
-                backup_remote = ""
+                backup_remote = have
         else:
-            say("backup: no remote set. Give a PRIVATE git repo URL: `hyra config set --user ledger_backup_remote <url>` "
-                "(until then the sealed claims exist only on the ledger machine)")
+            backup_remote = have
+            if not have:
+                say("backup: no remote set. Give a PRIVATE git repo URL: `hyra config set --user ledger_backup_remote <url>` "
+                    "(until then the sealed claims exist only on the ledger machine)")
     if backup_remote and backup_remote != "none":
-        _save_user_cfg("ledger_backup_remote", backup_remote)
+        if backup_remote != have:
+            _save_user_cfg("ledger_backup_remote", backup_remote)
         try:
             ld.backup(None, str(ld.default_backup_repo()), backup_remote, True, say=say)
-            say("backups now run by themselves every 6 hours")
+            say("backups run by themselves every 6 hours from now on")
         except HyraError as e:
-            say(f"saved the backup remote, but the first backup failed: {e}")
+            say(f"saved the backup remote, but the backup failed: {e}")

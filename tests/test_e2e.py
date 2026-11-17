@@ -1,6 +1,7 @@
 """End-to-end test of the hyra CLI in a temp project. Run: python3 -m unittest discover -s tests"""
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import unittest
 from pathlib import Path
 
 HYRA = str(Path(__file__).resolve().parent.parent / "skills" / "hyra" / "scripts" / "hyra")
+VERSION = re.search(r'__version__ = "([^"]+)"', (Path(__file__).resolve().parent.parent / "hyra" / "__init__.py").read_text()).group(1)
 
 
 class E2E(unittest.TestCase):
@@ -708,7 +710,7 @@ esac
         self.pre_cleanup = [lambda: self.h("server", "down", "--purge", "--yes", ok=None)]
         bare = Path(self.tmp.name) / "remote.git"; subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
         out = self.h("server", "up", "--local", "--no-service", "--expose", "none", "--backup-remote", str(bare))
-        self.assertIn("ledger is up", out); self.assertIn("backups now run by themselves", out)
+        self.assertIn("ledger is up", out); self.assertIn("backups run by themselves", out)
         self.assertIn("connected to your ledger server", self.h("init"))                # init needs no flags to connect
         self.assertEqual(json.loads((Path(self.env["HOME"]) / ".hyra/config.json").read_text())["ledger_backup_remote"], str(bare))
         clone = Path(self.tmp.name) / "c"; subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True)
@@ -792,6 +794,73 @@ esac
         s = json.loads(sf.read_text()); s.pop("last_backup_attempt", None); sf.write_text(json.dumps(s))
         self.h("status"); time.sleep(1.5)
         self.assertEqual(json.loads(sf.read_text())["last_backup"], "2020-01-01T00:00:00+00:00")
+
+    def test_rerunning_server_up_keeps_what_it_knew_and_failed_pushes_are_retried(self):
+        self.pre_cleanup = [lambda: self.h("server", "down", "--purge", "--yes", ok=None)]
+        bare = Path(self.tmp.name) / "remote.git"; subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+        up = lambda *extra: self.h("server", "up", "--local", "--no-service", "--expose", "none", *extra)
+        sf = Path(self.env["HOME"]) / ".hyra/ledger.json"
+        up("--backup-remote", str(bare))
+        first = json.loads(sf.read_text())
+        self.assertTrue(first.get("backup_repo") and first.get("last_backup"))
+        up()                                                                       # re-running `hyra server up` must not forget the backup state
+        again = json.loads(sf.read_text())
+        for k in ("backup_repo", "human_token", "runner_token"):
+            self.assertEqual(again.get(k), first.get(k), k)
+        self.assertGreaterEqual(again["last_backup"], first["last_backup"])      # re-running also backs up now: it moves forward, never lost
+        # the remote refuses the push (like an unauthorized ssh key): committed locally, but NOT counted as backed up
+        repo = Path(first["backup_repo"])
+        subprocess.run(["git", "-C", str(repo), "remote", "set-url", "origin", str(Path(self.tmp.name) / "no-such-remote.git")], check=True)
+        again["last_backup"] = "2020-01-01T00:00:00+00:00"; sf.write_text(json.dumps(again))
+        out = self.h("server", "backup")
+        self.assertIn("push failed", out); self.assertIn("will be retried", out)
+        self.assertEqual(json.loads(sf.read_text())["last_backup"], "2020-01-01T00:00:00+00:00")   # still overdue, so it retries soon
+        subprocess.run(["git", "-C", str(repo), "remote", "set-url", "origin", str(bare)], check=True)   # the key gets authorized...
+        self.assertIn("pushed to the remote", self.h("server", "backup"))                          # ...and `hyra server backup` just pushes
+        self.assertGreater(json.loads(sf.read_text())["last_backup"], "2026-01-01")
+        clone = Path(self.tmp.name) / "chk"; subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True)
+        self.assertTrue((clone / "ledger.sql").exists())
+
+    def test_rerunning_server_up_asks_for_the_remote_again_and_pushes(self):
+        """The first push failed (an unauthorized ssh key). Re-running `hyra server up` in a terminal must ask for the remote again,
+        showing the saved one, then save and push, even though a remote is already configured."""
+        import pty, select
+        self.pre_cleanup = [lambda: self.h("server", "down", "--purge", "--yes", ok=None)]
+        bare = Path(self.tmp.name) / "remote.git"; subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+        broken = Path(self.tmp.name) / "not-authorized.git"                                   # a remote that refuses the push
+        out = self.h("server", "up", "--local", "--no-service", "--expose", "none", "--backup-remote", str(broken))
+        self.assertIn("push failed", out)
+        cfgp = Path(self.env["HOME"]) / ".hyra/config.json"
+        self.assertEqual(json.loads(cfgp.read_text())["ledger_backup_remote"], str(broken))
+
+        def rerun(answer):
+            m, sl = pty.openpty()
+            p = subprocess.Popen([sys.executable, HYRA, "server", "up", "--local", "--no-service", "--expose", "none"], cwd=self.root,
+                                 stdin=sl, stdout=sl, stderr=sl, env=self.env)
+            buf, sent, end = "", False, time.time() + 60
+            while time.time() < end:
+                if select.select([m], [], [], 0.2)[0]:
+                    try:
+                        buf += os.read(m, 4096).decode(errors="replace")
+                    except OSError:
+                        break
+                if not sent and "Enter keeps it" in buf:
+                    os.write(m, (answer + "\n").encode()); sent = True
+                if p.poll() is not None and not select.select([m], [], [], 0.3)[0]:
+                    break
+            p.wait(timeout=30); os.close(sl); os.close(m)
+            self.assertEqual(p.returncode, 0, buf)
+            return buf
+        buf = rerun("")                                                                        # Enter: keeps the saved (still broken) remote
+        self.assertIn(str(broken), buf); self.assertIn("push failed", buf)
+        buf = rerun(str(bare))                                                                 # type the right one: saved, and it pushes
+        self.assertIn("pushed to the remote", buf)
+        self.assertEqual(json.loads(cfgp.read_text())["ledger_backup_remote"], str(bare))
+        repo = Path(json.loads((Path(self.env["HOME"]) / ".hyra/ledger.json").read_text())["backup_repo"])
+        self.assertEqual(subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True, text=True).stdout.strip(), str(bare))
+        clone = Path(self.tmp.name) / "chk2"; subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True)
+        self.assertTrue((clone / "ledger.sql").exists())                                       # the snapshot that was stuck locally is now there
+        self.assertIn("pushed to the remote", rerun(""))                                       # and re-running again with Enter is harmless
 
     def test_ledger_dump_and_restore_roundtrip(self):
         sys.path.insert(0, str(Path(HYRA).resolve().parents[3]))
@@ -1123,7 +1192,7 @@ echo ok > r.txt; hyra task complete $HYRA_TASK --summary "SEALED-BY-SESSION" --e
                                              env=dict(self.env, **env, **k.get("env", {})))
         self.assertIn("missing", run("setup", "--cli", "--check").stdout)
         out = run("setup", "--cli").stdout
-        self.assertIn("installed hyra 0.3.0", out)
+        self.assertIn(f"installed hyra {VERSION}", out)
         link, real = home / "bin" / "hyra", home / ".hyra/cli/hyra"
         self.assertTrue(link.is_symlink() and real.is_file() and not real.is_symlink())            # a real copy, not a link into the repo
         self.assertEqual(Path(os.path.realpath(link)), real.resolve())
@@ -1131,7 +1200,7 @@ echo ok > r.txt; hyra task complete $HYRA_TASK --summary "SEALED-BY-SESSION" --e
         # the repo disappears; the command keeps working everywhere
         shutil.rmtree(Path(self.tmp.name) / "repo-a")
         r = subprocess.run([str(link), "--version"], capture_output=True, text=True, env=dict(self.env, **env))
-        self.assertEqual(r.stdout.strip(), "hyra 0.3.0")
+        self.assertEqual(r.stdout.strip(), f"hyra {VERSION}")
         r = subprocess.run([str(link), "init"], cwd=self.root, capture_output=True, text=True, env=dict(self.env, **env))
         self.assertEqual(r.returncode, 0, r.stderr)
 
@@ -1141,7 +1210,7 @@ echo ok > r.txt; hyra task complete $HYRA_TASK --summary "SEALED-BY-SESSION" --e
         env = dict(env, PATH=f"{home / 'bin'}:/usr/bin:/bin")
         (home / "bin" / "hyra").symlink_to(HYRA)                                                    # the old layout: a link into the repo
         out = self.h("setup", "--cli", "--check", env=env)
-        self.assertIn("ok (0.3.0", out); self.assertIn("link into a repo", out)
+        self.assertIn(f"ok ({VERSION}", out); self.assertIn("link into a repo", out)
         out = self.h("setup", "--cli", env=env)
         self.assertIn("now independent of any repo", out)
         self.assertEqual(Path(os.path.realpath(home / "bin" / "hyra")), (home / ".hyra/cli/hyra").resolve())
@@ -1161,14 +1230,14 @@ echo ok > r.txt; hyra task complete $HYRA_TASK --summary "SEALED-BY-SESSION" --e
         stub('echo "usage: hyra [-h]  error: unrecognized arguments: --version" >&2; exit 2')       # an old hyra: no --version at all
         out = check(); self.assertIn("upgrade-available", out); self.assertIn("older version with no version number", out)
         stub('echo "hyra 0.2.0"')
-        out = check(); self.assertIn("installed 0.2.0", out); self.assertIn("these skills carry 0.3.0", out)
+        out = check(); self.assertIn("installed 0.2.0", out); self.assertIn(f"these skills carry {VERSION}", out)
         up = self.h("setup", "--cli", env=env)                                                       # explicit command = consent: upgrades
-        self.assertIn("installed hyra 0.3.0", up); self.assertIn("it replaced 0.2.0", up)
-        self.assertIn("ok (0.3.0", check())
+        self.assertIn(f"installed hyra {VERSION}", up); self.assertIn("it replaced 0.2.0", up)
+        self.assertIn(f"ok ({VERSION}", check())
         stub('echo "hyra 9.9.9"')
         out = check(); self.assertIn("newer: installed 9.9.9", out)
         self.assertIn("not downgrading", self.h("setup", "--cli", env=env))                         # never silently downgrades
-        self.assertIn("installed hyra 0.3.0", self.h("setup", "--cli", "--force", env=env))
+        self.assertIn(f"installed hyra {VERSION}", self.h("setup", "--cli", "--force", env=env))
         # installing the toolkit never upgrades behind your back: it only tells you
         stub('echo "hyra 0.2.0"')
         out = self.h("setup", "--toolkit", "local", env=env)
@@ -1193,7 +1262,7 @@ echo ok > r.txt; hyra task complete $HYRA_TASK --summary "SEALED-BY-SESSION" --e
         self.assertEqual(r.returncode, 0, r.stderr)
         where = (self.root / "where").read_text().split("\n")
         self.assertEqual(Path(where[0]).resolve().parent, (home / ".hyra/cli").resolve())                                # the session's `hyra` is the global one
-        self.assertEqual(where[1], "hyra 0.3.0")
+        self.assertEqual(where[1], f"hyra {VERSION}")
         self.assertIn("[done]", subprocess.run([str(home / "bin" / "hyra"), "task", "show", "1"], cwd=self.root, capture_output=True, text=True, env=full).stdout)
 
     def test_a_newer_bundle_in_the_skills_is_announced_by_the_cli(self):
@@ -1206,9 +1275,9 @@ echo ok > r.txt; hyra task complete $HYRA_TASK --summary "SEALED-BY-SESSION" --e
         run = lambda sk: subprocess.run([str(home / "bin" / "hyra"), "status"], cwd=self.root, capture_output=True, text=True,
                                         env=dict(self.env, **env, HYRA_SKILL_DIR=str(sk / "hyra")))
         r = run(skills)
-        self.assertIn("these skills carry hyra 0.9.0 but this is 0.3.0", r.stderr)
+        self.assertIn(f"these skills carry hyra 0.9.0 but this is {VERSION}", r.stderr)
         self.assertIn("setup --cli", r.stderr)
-        (skills / "hyra/scripts/hyra.pyz.version").write_text("0.3.0\n")
+        (skills / "hyra/scripts/hyra.pyz.version").write_text(VERSION + "\n")
         self.assertNotIn("these skills carry", run(skills).stderr)                                  # silent when versions match
 
     def test_version_numbers_agree(self):

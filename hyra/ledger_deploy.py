@@ -348,12 +348,15 @@ def up(target: Optional[str], *, auto: bool, port: int, use_service: bool, rotat
     # first-run tokens: read once over ssh, then delete them from the server
     rc, out, _ = host.run(f'F="$HOME/.hyra-server/initial-tokens.txt"; [ -f "$F" ] && cat "$F" && rm -f "$F" || true')
     toks = dict(l.split("=", 1) for l in out.split() if "=" in l)
-    new = {"target": "local" if local else target_s, "url": url, "port": port, "mode": mode, "expose": used, "home": f["home"],
-           "tailscale": ts, "python": f["python"], "os": f["os"]}
-    if toks.get("HYRA_HUMAN_TOKEN"):
+    where_to = "local" if local else target_s
+    # re-running `up` against the same machine keeps everything else we know (backup repo, last backup, cached tokens...)
+    new = dict(state) if state.get("target") == where_to else {}
+    new.pop("stopped", None)
+    new.update({"target": where_to, "url": url, "port": port, "mode": mode, "expose": used, "home": f["home"],
+                "tailscale": ts, "python": f["python"], "os": f["os"]})
+    if toks.get("HYRA_HUMAN_TOKEN"):  # first run, or --rotate-tokens: new tokens; the cached short-lived one is now invalid
         new.update(human_token=toks["HYRA_HUMAN_TOKEN"], runner_token=toks["HYRA_RUNNER_TOKEN"])
-    elif state.get("target") == new["target"]:
-        new.update({k: state[k] for k in ("human_token", "runner_token") if k in state})
+        new.pop("overall_token", None); new.pop("overall_expires", None)
     if "human_token" not in new:
         raise HyraError(f"the ledger on {host.label} already has tokens that aren't saved on this machine. Run `hyra server up --rotate-tokens` to mint new ones")
     save_state(new)
@@ -453,8 +456,11 @@ def backup(repo: Optional[str], init: Optional[str], remote: Optional[str], push
             else:
                 path.mkdir(parents=True)
                 subprocess.run(["git", "init", "-q", str(path)], check=True)
-        if remote and "origin" not in _git(path, "remote", check=False).stdout.split():
-            _git(path, "remote", "add", "origin", remote)
+        if remote:
+            if "origin" not in _git(path, "remote", check=False).stdout.split():
+                _git(path, "remote", "add", "origin", remote)
+            elif _git(path, "remote", "get-url", "origin", check=False).stdout.strip() != remote:  # you changed the remote
+                _git(path, "remote", "set-url", "origin", remote)
         (path / "README.md").write_text("# hyra ledger backup\n\nSnapshots of a hyra ledger server (`hyra server backup`): sealed claims, reviews, approvals, "
                                         "audit trail, as SQL. **Keep this repository private.** Restore with `hyra server restore --from <this dir>`.\n", encoding="utf-8")
         s["backup_repo"] = str(path.resolve())
@@ -478,14 +484,18 @@ def backup(repo: Optional[str], init: Optional[str], remote: Optional[str], push
         _git(path, "-c", "user.name=hyra", "-c", "user.email=hyra@localhost", "commit", "-q", "-m",
              f"ledger backup {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}Z ({n} sealed claims)")
         say(f"ledger backup committed in {path}")
-    s["last_backup"] = datetime_now_iso()
     s["backup_repo"] = str(path.resolve())
-    save_state(s)
+    pushed_ok = True
     if push and "origin" in _git(path, "remote", check=False).stdout.split():
         r = _git(path, "push", "-q", "-u", "origin", "HEAD", check=False)
-        say("pushed to the remote" if r.returncode == 0 else f"WARNING: committed locally but the push failed: {(r.stderr or r.stdout).strip()[:200]}")
+        pushed_ok = r.returncode == 0
+        say("pushed to the remote" if pushed_ok else f"WARNING: committed locally but the push failed: {(r.stderr or r.stdout).strip()[:200]} "
+                                                      "(it will be retried; fix the remote or your git credentials, then `hyra server backup`)")
     elif push:
         say("note: this backup repo has no remote, so it is only on this machine (`git -C <repo> remote add origin <private repo>`)")
+    if pushed_ok:  # a snapshot that never left this machine doesn't count as a backup: keep retrying
+        s["last_backup"] = datetime_now_iso()
+    save_state(s)
 
 
 def datetime_now_iso() -> str:
