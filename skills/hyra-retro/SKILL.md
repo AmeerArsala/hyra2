@@ -35,6 +35,9 @@ Look for:
   delete it: what was believed and why it changed is useful too.
 - Entries useful beyond this project → `hyra books sync <id>` (approval-gated) into the shared library.
 
+- If a wiki vault is configured: `hyra wiki export <id>` for verified/convention entries worth keeping
+  alongside outside knowledge. It writes a draft only (approval-gated); the wiki's curator promotes it.
+
 ## 4. Distill skills
 When several entries form a repeatable procedure (e.g. "training a small scientific model from
 scratch", "debugging loss spikes", "verifying a kernel against a reference"):

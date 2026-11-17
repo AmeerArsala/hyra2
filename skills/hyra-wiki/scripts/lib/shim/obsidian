@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Filesystem stand-in for the Obsidian CLI (only the subcommands hyra-wiki's scripts use).
+
+The wiki scripts were written against Obsidian's `obsidian vault=<name> <cmd> ...` CLI, which needs the
+desktop app running. When that CLI isn't installed the scripts put this shim first on PATH, so they work
+from plain markdown on disk in any harness. The vault is taken from $WIKI_VAULT_PATH (set by the scripts).
+
+  files folder=<dir> [total]           vault-relative file paths under dir (or just the count)
+  property:read name=<key> path=<p>|file=<page>     frontmatter value; list items one per line
+  search query=<q> [path=<dir>] [limit=<n>]          matching page paths, best first
+  tags [total] | tags sort=count counts              "#tag count" lines, or the number of distinct tags
+  backlinks file=<page> counts                       "<path>\\t<n>" for pages linking to it
+  links file=<page>                                  outgoing links; unresolved ones are marked
+"""
+import os
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+VAULT = Path(os.environ.get("WIKI_VAULT_PATH", ".")).resolve()
+SKIP = {".git", ".obsidian", "node_modules"}
+LINK = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
+
+
+def files(folder=""):
+    base = VAULT / folder
+    out = []
+    if base.is_dir():
+        for p in sorted(base.rglob("*")):
+            rel = p.relative_to(VAULT)
+            if p.is_file() and not any(part in SKIP or part.startswith(".") for part in rel.parts):
+                out.append(str(rel))
+    return out
+
+
+def split_fm(text):
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end > 0:
+            return text[4:end], text[end + 4:]
+    return "", text
+
+
+def frontmatter(path):
+    """Minimal YAML: scalars, inline [a, b] lists, and block lists. Returns {key: str | list[str]}."""
+    fm, _ = split_fm(Path(path).read_text(errors="replace"))
+    meta, key = {}, None
+    for line in fm.splitlines():
+        m = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", line)
+        if m:
+            key, val = m.group(1), m.group(2).strip()
+            if val.startswith("[") and val.endswith("]"):
+                meta[key] = [x.strip().strip("\"'") for x in val[1:-1].split(",") if x.strip()]
+            elif val == "":
+                meta[key] = []
+            else:
+                meta[key] = val.strip("\"'")
+        elif key and re.match(r"^\s+-\s+", line) and isinstance(meta.get(key), list):
+            meta[key].append(re.sub(r"^\s+-\s+", "", line).strip().strip("\"'"))
+    return meta
+
+
+def pages():
+    return [f for f in files("") if f.endswith(".md")]
+
+
+def resolve(name):
+    """Resolve a page by vault-relative path or wikilink-style name (basename, no extension)."""
+    for cand in (name, name + ".md"):
+        if (VAULT / cand).is_file():
+            return cand
+    stem = name.removesuffix(".md").lower()
+    hits = [p for p in pages() if Path(p).stem.lower() == stem]
+    hits.sort(key=lambda p: (not p.startswith("wiki/"), len(p)))
+    return hits[0] if hits else None
+
+
+def emit(lines):
+    """Print one item per line; print nothing at all for an empty result (like the real CLI)."""
+    lines = list(lines)
+    if lines:
+        print("\n".join(lines))
+
+
+def args_of(argv):
+    kv, flags = {}, []
+    for a in argv:
+        if "=" in a and not a.startswith("="):
+            k, v = a.split("=", 1)
+            kv[k] = v
+        else:
+            flags.append(a)
+    return kv, flags
+
+
+def main():
+    argv = sys.argv[1:]
+    argv = [a for a in argv if not a.startswith("vault=")]
+    if not argv:
+        return 2
+    cmd, (kv, flags) = argv[0], args_of(argv[1:])
+    if cmd == "files":
+        fs = files(kv.get("folder", ""))
+        print(len(fs)) if "total" in flags else emit(fs)
+    elif cmd == "property:read":
+        page = kv.get("path") or resolve(kv.get("file", ""))
+        if not page or not (VAULT / page).is_file():
+            return 1
+        v = frontmatter(VAULT / page).get(kv["name"])
+        if v in (None, "", []):
+            return 0
+        emit(v if isinstance(v, list) else [v])
+    elif cmd == "search":
+        terms = [t for t in re.split(r"\s+", kv.get("query", "").lower()) if t]
+        scored = []
+        for p in files(kv.get("path", "")):
+            if not p.endswith(".md"):
+                continue
+            text = (VAULT / p).read_text(errors="replace").lower()
+            hit = sum(t in text for t in terms)
+            if hit:
+                title = Path(p).stem.lower()
+                scored.append((-(hit == len(terms)), -sum(t in title for t in terms), -sum(text.count(t) for t in terms), p))
+        scored.sort()
+        emit(p for *_, p in scored[: int(kv.get("limit", 20))])
+    elif cmd == "tags":
+        c = Counter()
+        for p in pages():
+            t = frontmatter(VAULT / p).get("tags", [])
+            c.update(x.lstrip("#") for x in (t if isinstance(t, list) else [t]) if x)
+        if "total" in flags:
+            print(len(c))
+        else:
+            emit(f"#{t} {n}" for t, n in sorted(c.items(), key=lambda x: (-x[1], x[0])))
+    elif cmd in ("backlinks", "links"):
+        page = resolve(kv.get("file", ""))
+        if not page:
+            return 1
+        if cmd == "links":
+            seen = []
+            for name in LINK.findall((VAULT / page).read_text(errors="replace")):
+                r = resolve(name.strip())
+                line = r if r else f"{name.strip()} (unresolved)"
+                if line not in seen:
+                    seen.append(line)
+            emit(seen)
+        else:
+            for p in pages():
+                n = sum(1 for name in LINK.findall((VAULT / p).read_text(errors="replace"))
+                        if resolve(name.strip()) == page)
+                if n and p != page:
+                    print(f"{p}\t{n}")
+    else:
+        print(f"obsidian shim: unsupported command {cmd!r}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

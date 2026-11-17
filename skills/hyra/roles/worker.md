@@ -14,7 +14,7 @@ If `hyra` is not on your PATH, use `python3 <hyra skill dir>/scripts/hyra`.
 
 ## Start
 1. `hyra brief task:<id>`: task spec, mission problem, notes from earlier attempts or wake-ups, inbox.
-2. `hyra books search "<key terms>"`: reuse what is already known. Verified entries are reliable;
+2. `hyra books search "<key terms>"` (and `hyra wiki search` if your briefing mentions a wiki vault; read-only): reuse what is already known. Verified entries are reliable;
    observations are leads, not facts. Check the skills you have for one that fits.
 3. If the task is resuming after a sleep, read your earlier notes and check the thing you were waiting for.
 
@@ -23,10 +23,11 @@ If `hyra` is not on your PATH, use `python3 <hyra skill dir>/scripts/hyra`.
   These notes are the raw execution trace that reviewers read.
 - Commit code changes (or record paths/diffs) so the exact code version is recoverable.
 - Save results and logs to files; you will attach them as evidence.
-- Long-running jobs (training, big sweeps): submit them, record the job id/log path in a note, then
-  `hyra task sleep <id> --until +2h --reason "<what to check on wake-up>"` and stop. Do not busy-wait
-  for hours. Jobs that need significant compute must already be approved; if not, ask with
-  `hyra approval request --kind compute --what "..." --task <id>` and sleep.
+- Long-running jobs (training, big sweeps): submit them, record the job id/log path in a note, then park the task so it
+  resumes when the job is done, not on a guess: `hyra task sleep <id> --until-file <path the job writes when finished>`
+  or `--until-cmd "<command that exits 0 once it finished>"` (add `--until +6h` as a fallback deadline), with
+  `--reason "<what to check on wake-up>"`. Then stop. Don't busy-wait for hours. Jobs that need significant
+  compute must already be approved; if not, ask with `hyra approval request --kind compute --what "..." --task <id>` and sleep.
 - If the spec is wrong, the hypothesis looks false, or there's a better idea, **challenge the Mission**:
   `hyra msg send --to mission:<slug> --subject "..." --body "..." [--requires-response]`, and post
   ideas with `hyra board post --type idea --mission <slug> --task <id> "..."`.
@@ -45,5 +46,5 @@ If `hyra` is not on your PATH, use `python3 <hyra skill dir>/scripts/hyra`.
 - Never report a number you did not observe in a log or file you attach.
 - Never weaken an evaluator, test, or check to make a result pass. If a check seems wrong, report that as a finding.
 - If you could only partially verify something, say exactly which part.
-- Before you exit, update `hyra memory path task:<id>` only if a later attempt would need it; durable,
+- Before you exit, record in `hyra memory note ... --agent task:<id>` only what a later attempt would need; durable,
   reusable lessons go to Books (`hyra books add ... --evidence T<id>`) as observations.

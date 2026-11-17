@@ -28,14 +28,23 @@ If `hyra` is not on your PATH, use `python3 <hyra skill dir>/scripts/hyra`.
    acceptance criteria. Use `--after` for dependencies, `--resource gpu=N` for compute (large requests
    are approval-gated), and `--model` / `--harness` to get different perspectives on the same question. Run
    exploratory, experimental and review tasks in parallel when they're independent.
-5. **Update memory** (`hyra memory path mission:<slug>`; edit the file): current understanding (with
-   evidence pointers), key hypotheses, ruled-out approaches (and what ruled them out), next steps.
-   Rewrite it; don't just append.
-6. **Set the next wake-up** before exiting: `hyra mission wake <slug> --at +3h --reason "check T12 training curve"`.
-   You're also woken automatically on new mail, or when your tasks finish and nothing is left in flight.
+5. **Update memory** (a two-level hierarchy; rewrite, don't append): keep the level-0 index (`hyra memory path mission:<slug>`,
+   about 25 lines) current: understanding with evidence pointers, key hypotheses, ruled-out approaches and what ruled them out,
+   next steps, one line each. Put the detail in nodes: `hyra memory note hypotheses|ruled-out|understanding|next "<title>" --text ... --summary "<one line>" --agent mission:<slug>`.
+   Future briefings show the index and a tree of node titles, so keep titles and summaries informative.
+6. **Set the next wake-up** before exiting: `hyra mission wake <slug> --at +3h --reason "check T12 training curve"`, or better, wake
+   on the event itself: `--until-file <checkpoint or result file>` / `--until-cmd "<exits 0 when ready>"` with `--at` as the fallback
+   deadline. You're also woken automatically on new mail, or when any of your tasks finishes.
+
+## Ideas
+The Research Board is the idea register. Each wake-up, read the "Ideas on the Research Board" section of your briefing
+(or `hyra board ideas --mission <slug>`). For each **untested** idea, decide: test it (queue a task whose spec cites
+`board:<id>`, states the hypothesis and what would falsify it), park it, or drop it with a `decision` entry
+(`--ref board:<id>` and the reason). Never leave ideas silently pending when you close the mission.
 
 ## Knowledge
-- Search Books before designing experiments: `hyra books search "..."`.
+- Search Books before designing experiments: `hyra books search "..."`. If a wiki vault is configured
+  (`hyra brief` says so), also `hyra wiki search "..."` for outside background (read-only; not evidence).
 - When a lesson recurs or is independently reproduced, record or promote it
   (`hyra books add`, `hyra books promote <id> --to verified --evidence T<repro>`). Conventions and
   syncing to the shared library need human approval; request it and move on.
@@ -49,7 +58,7 @@ only a human can resolve. Keep advancing whatever is already authorized while yo
 ## Closing
 When the problem is answered (or provably stuck), `hyra mission close <slug> --conclusion "..."`.
 The conclusion must cite task ids and review verdicts and state its own limits. Then run a
-retrospective (the `hyra-retro` skill) so the next project starts from a better place. If stuck, name
+retrospective (the `hyra-retro` skill; the mission shows as pending until a `retro` Board entry exists) so the next project starts from a better place. If stuck, name
 the constraint (model capability, search inefficiency, slow verification or feedback) and propose the
 tool that would remove it.
 

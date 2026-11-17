@@ -39,6 +39,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # substituted; the flag right before "{model}" is dropped when no model is set.
     "harness": "claude",
     "harness_cmds": {},
+    # Default model per harness when a task doesn't name one, e.g. {"opencode": "provider/model"}.
+    "harness_models": {},
+    # Unattended Overall (daemon mode): wakes when something needs the human-facing layer. Set false to disable.
+    "overall_agent": True, "overall_min_gap_minutes": 60, "overall_stall_hours": 6,
+    "auto_retro": True,          # a closed mission with no retro Board entry gets a retrospective session
+    "auto_check_tasks": True,    # narrower/refuted review verdicts queue a task that turns the flaw into an automated check
+    "approvals_require_tty": False,   # if true, `approval grant|deny` only works from a real terminal (agent shells aren't ttys)
+    "notify_cmd": "",            # shell command run (env HYRA_NOTIFY_TEXT) when a message for the human arrives, e.g. ntfy/osascript
+    # Optional llm-obsidian-wiki vault (see hyra/wiki.py): {"vault": "/path", "cluster": "hyra"}.
+    "wiki": {},
     "max_missions_running": 2,
     "max_attempts": 2,
     "poll_seconds": 30,
@@ -56,14 +66,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
 # (unattended workers can't answer prompts); override per project in config "harness_cmds".
 HARNESS_PRESETS: dict[str, list[str]] = {
     # Claude Code: role loaded natively as the subagent definition (~/.claude/agents/hyra-<role>.md,
-    # installed by `hyra setup`); if that file is missing, "--agent {agent}" is dropped and the
+    # installed by the toolkit install); if that file is missing, "--agent {agent}" is dropped and the
     # role is embedded in the prompt like for every other harness.
     "claude": ["claude", "-p", "--permission-mode", "auto", "--agent", "{agent}", "--model", "{model}", "{prompt}"],
     "codex": ["codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check",
               "-m", "{model}", "{prompt}"],
-    # Antigravity CLI (Google's successor to Gemini CLI); Go-style flags must precede the prompt.
-    "agy": ["agy", "-p", "--dangerously-skip-permissions", "--model", "{model}", "{prompt}"],
-    "opencode": ["opencode", "run", "-m", "{model}", "{prompt}"],
+    # Antigravity CLI (Google's successor to Gemini CLI). Go-style flags: -p takes the NEXT token as its
+    # prompt, so it must be attached as -p=<prompt>. --mode auto = auto-approve without skipping all permissions
+    # (not available on every account; add --dangerously-skip-permissions via harness_cmds if runs stall on prompts).
+    "agy": ["agy", "--mode", "auto", "--agent", "{agent}", "--model", "{model}", "-p={prompt}"],
+    # Kimi Code: -p takes the prompt; --yolo = "Ask When Needed" (routine edits/commands auto-run), --auto = never ask.
+    "kimi": ["kimi", "--yolo", "--agent", "{agent}", "-m", "{model}", "-p", "{prompt}"],
+    # oh-my-pi (omp): -p is a boolean, the prompt is positional; its default approval mode is already yolo.
+    "omp": ["omp", "-p", "--model", "{model}", "{prompt}"],
+    # Pi (omp's upstream): same print-mode shape (not verified live).
+    "pi": ["pi", "-p", "--model", "{model}", "{prompt}"],
+    "opencode": ["opencode", "run", "--agent", "{agent}", "-m", "{model}", "{prompt}"],
     "amp": ["amp", "--dangerously-allow-all", "-x", "{prompt}"],
 }
 
@@ -147,6 +165,8 @@ def skill_dir() -> Path:
              Path(os.environ.get("HYRA_SKILL_DIR", "/nonexistent")),
              home / ".agents" / "skills" / "hyra",
              Path(os.environ.get("CLAUDE_CONFIG_DIR", home / ".claude")) / "skills" / "hyra"]
+    for parent in [Path.cwd(), *Path.cwd().parents]:  # project-local toolkit installs
+        cands += [parent / ".agents" / "skills" / "hyra", parent / ".claude" / "skills" / "hyra"]
     for c in cands:
         if (c / "roles" / "worker.md").exists():
             return c.resolve()
@@ -183,6 +203,12 @@ class Store:
         cols = {r["name"] for r in self.db.execute("PRAGMA table_info(tasks)")}
         if "harness" not in cols:
             self.db.execute("ALTER TABLE tasks ADD COLUMN harness TEXT")
+        if "remote_id" not in {r["name"] for r in self.db.execute("PRAGMA table_info(approvals)")}:
+            self.db.execute("ALTER TABLE approvals ADD COLUMN remote_id INTEGER")  # id on the ledger server (server mode)
+        if "wake_cmd" not in cols:  # condition-based wake-ups (event-driven resume)
+            self.db.execute("ALTER TABLE tasks ADD COLUMN wake_cmd TEXT")
+        if "wake_cmd" not in {r["name"] for r in self.db.execute("PRAGMA table_info(missions)")}:
+            self.db.execute("ALTER TABLE missions ADD COLUMN wake_cmd TEXT")
         self.config = self._load_config()
 
     def harness_cmd(self, name: str) -> list[str]:
@@ -200,8 +226,9 @@ class Store:
             (d / sub).mkdir(parents=True, exist_ok=True)
         cfg_path = d / "config.json"
         if not cfg_path.exists():
-            cfg = dict(DEFAULT_CONFIG, project=project, goal=goal)
-            cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+            # Only what is specific to this project. Defaults and your machine-wide ~/.hyra/config.json apply underneath
+            # (copying every default here would silently override the user-level layer). See `hyra config show`.
+            cfg_path.write_text(json.dumps({"project": project, "goal": goal}, indent=2) + "\n")
         st = cls(root)
         mem = st.memory_path("overall")
         if not mem.exists():
@@ -213,10 +240,13 @@ class Store:
         return cls(find_root())
 
     def _load_config(self) -> dict[str, Any]:
-        p = self.dir / "config.json"
+        """defaults < ~/.hyra/config.json (your machine-wide choices, e.g. harness_models) < <project>/.hyra/config.json.
+        Dict-valued keys (harness_models, harness_cmds, resources, ...) are merged key by key."""
         cfg = dict(DEFAULT_CONFIG)
-        if p.exists():
-            cfg.update(json.loads(p.read_text()))
+        for p in (Path.home() / ".hyra" / "config.json", self.dir / "config.json"):
+            if p.exists():
+                for k, v in json.loads(p.read_text()).items():
+                    cfg[k] = {**cfg[k], **v} if isinstance(v, dict) and isinstance(cfg.get(k), dict) else v
         return cfg
 
     # ---- helpers --------------------------------------------------------
@@ -246,9 +276,17 @@ class Store:
             raise HyraError(f"no mission {slug!r}")
         return row
 
+    def memory_dir(self, agent: str) -> Path:
+        return self.dir / "memory" / agent.replace(":", "__").replace("/", "_")
+
     def memory_path(self, agent: str) -> Path:
-        safe = agent.replace(":", "__").replace("/", "_")
-        return self.dir / "memory" / f"{safe}.md"
+        """Level 0 of the agent's memory hierarchy: memory/<agent>/index.md (a short summary that points to nodes)."""
+        d = self.memory_dir(agent)
+        legacy = d.parent / f"{d.name}.md"  # flat file from before memory was hierarchical
+        d.mkdir(parents=True, exist_ok=True)
+        if legacy.exists() and not (d / "index.md").exists():
+            legacy.rename(d / "index.md")
+        return d / "index.md"
 
     def post(self, author: str, type_: str, text: str, mission: Optional[str] = None,
              task: Optional[int] = None, refs: Optional[list] = None) -> int:
@@ -281,17 +319,24 @@ class _Tx:
         self.db.execute("ROLLBACK" if exc_type else "COMMIT")
 
 
+MEMORY_SECTIONS = {"understanding": "Current understanding", "hypotheses": "Key hypotheses",
+                   "ruled-out": "Ruled out", "next": "Next steps"}
+
+
 def memory_template(agent: str) -> str:
     return f"""# Working memory: {agent}
 
-Hierarchical, self-maintained. Keep it short; rewrite rather than append.
-Promote anything reusable beyond this project to Books (`hyra books add`).
+A small hierarchy you maintain yourself. THIS page is level 0: keep it to about 25 lines, one line per item, each pointing to
+where the detail lives. Detail goes in nodes (level 1) so future sessions read the summary first and open only what they need:
+  hyra memory note <section> "<title>" --text "..." --summary "<one line>"      (rewrites the node if it exists)
+sections: understanding | hypotheses | ruled-out | next.   See the tree: `hyra memory tree`. Open a node: `hyra memory show --node <path>`.
+Anything reusable beyond this project belongs in Books (`hyra books add`), not here.
 
 ## Current understanding
-- (what is true right now, with pointers to evidence: task ids, board ids, paths)
+- (what is true right now, one line each, with pointers: task ids, board ids, node paths)
 
 ## Key hypotheses
-- (open bets; for each: why we believe it, what would falsify it, which task tests it)
+- (open bets: why we believe each, what would falsify it, which task tests it)
 
 ## Ruled out
 - (approaches tried and rejected, with the evidence that killed them, so nobody retries them blindly)

@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
-"""Launcher for the hyra CLI. The source lives in the repo's top-level `hyra/` package; this
-finds it by walking up from this file's real location (symlinks resolved), and falls back to an
-installed `hyra` package (`pip install` / `uv tool install` from the repo)."""
+"""Launcher for the hyra CLI. It works from three layouts, in this order:
+  1. a source checkout (`<repo>/hyra/cli.py` above this file): used as is, for development;
+  2. `hyra.pyz` next to this file: a self-contained bundle of the same package, so a skills-only install
+     (`npx skills add`, copied skill folders) needs nothing but Python 3.9+;
+  3. an installed `hyra` package (pip / uv tool install).
+Symlinks (e.g. ~/.local/bin/hyra) are resolved first, so this works from anywhere."""
 import os
 import sys
 
-here = os.path.dirname(os.path.realpath(__file__))
+scripts = os.path.dirname(os.path.realpath(__file__))
+here = scripts
 for _ in range(5):
     if os.path.isfile(os.path.join(here, "hyra", "cli.py")):
         sys.path.insert(0, here)
         break
     here = os.path.dirname(here)
+else:
+    bundle = os.path.join(scripts, "hyra.pyz")
+    if os.path.isfile(bundle):
+        sys.path.insert(0, bundle)
+        os.environ.setdefault("HYRA_SKILL_DIR", os.path.dirname(scripts))  # roles/, SKILL.md live next to scripts/
 
 from hyra.cli import main  # noqa: E402
 

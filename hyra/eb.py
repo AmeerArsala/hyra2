@@ -14,10 +14,12 @@ the scratch dir. It must print a line `SCORE: <number>` (last one wins). Optiona
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -75,15 +77,65 @@ def eb_init(st: Store, name: str, evaluator: str, task_desc: str, direction: str
     print(f"experience bank {name} at {d} (evaluator v1, {direction}imize score)")
 
 
+def sandbox_command(st: Store, work: Path) -> tuple[str, list[str]]:
+    """How to isolate one evaluation. A fresh scratch copy is always used; on top of that (config `eb_sandbox`):
+      auto (default): macOS sandbox-exec (no network, no writes outside the scratch dir, project .hyra unreadable) or
+                      Linux bubblewrap (read-only root, no network, project .hyra hidden); otherwise falls back to
+                      'none' with a warning;
+      podman | docker: a throwaway container: no network, read-only root, all capabilities dropped, only the scratch dir
+                      writable, image from `eb_sandbox_image` (must contain bash; never pulled implicitly by `auto`);
+      none: scratch copy only.
+    `eb_sandbox_prefix` (a command list) overrides everything."""
+    custom = st.config.get("eb_sandbox_prefix")
+    if custom:
+        return "custom", list(custom)
+    mode = st.config.get("eb_sandbox", "auto")
+    w = str(work.resolve())
+    if mode in ("auto", "sandbox-exec") and sys.platform == "darwin" and shutil.which("sandbox-exec"):
+        profile = ('(version 1)(allow default)(deny network*)(deny file-write*)'
+                   f'(allow file-write* (subpath "{w}") (subpath "/dev"))'
+                   f'(deny file-read* (subpath "{st.dir.resolve()}"))')
+        return "sandbox-exec", ["sandbox-exec", "-p", profile]
+    if mode in ("auto", "bwrap") and sys.platform.startswith("linux") and shutil.which("bwrap"):
+        return "bwrap", ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", str(st.dir.resolve()),
+                         "--bind", w, w, "--unshare-net", "--unshare-pid", "--unshare-ipc", "--new-session",
+                         "--die-with-parent", "--chdir", w]
+    if mode in ("podman", "docker") and shutil.which(mode):
+        image = st.config.get("eb_sandbox_image") or st.config.get("eb_docker_image") or "python:3.12-slim"
+        userns = ["--userns=keep-id"] if mode == "podman" else []  # rootless podman: files stay owned by the caller
+        return mode, [mode, "run", "--rm", "--network", "none", "--read-only", "--tmpfs", "/tmp", "--cap-drop", "ALL",
+                      "--security-opt", "no-new-privileges", "--security-opt", "label=disable", *userns,
+                      "-v", f"{w}:{w}", "-w", w, "-e", f"HOME={w}", "-e", f"TMPDIR={w}", "-e", "PYTHONDONTWRITEBYTECODE=1", image]
+    return "none", []
+
+
+_WARNED: set[str] = set()
+
+
 def _run_eval(st: Store, d: Path, cfg: dict, sol_dir: Path, ev: str) -> dict:
     with tempfile.TemporaryDirectory(prefix=f"hyra-eb-{cfg['name']}-") as tmp:
-        work = Path(tmp)
+        work = Path(tmp).resolve()
         shutil.copytree(sol_dir, work / "solution")
         shutil.copytree(d / "evaluators" / ev, work / "evaluator")
-        cmd = list(st.config.get("eb_sandbox_prefix") or []) + ["bash", str(work / "evaluator" / "eval.sh"), str(work / "solution")]
+        mode, prefix = sandbox_command(st, work)
+        if mode == "none" and "none" not in _WARNED:
+            _WARNED.add("none")
+            print("warning: evaluation runs in a scratch copy only (no network/filesystem sandbox available; "
+                  "set eb_sandbox to podman or docker, or eb_sandbox_prefix)", file=sys.stderr)
+        # Solutions are untrusted code: no API keys or credentials from the parent environment.
+        if mode in ("podman", "docker"):
+            # The engine process needs the caller's HOME / XDG_RUNTIME_DIR / DOCKER_HOST to find its (rootless) storage and
+            # socket; found live on Linux: stripping them made rootless podman fall back to root-only paths and fail. The
+            # evaluator inside the container only sees the explicit -e flags in the command, so no credentials leak.
+            env = dict(os.environ)
+        else:
+            keep = ["PATH", "LANG", "LC_ALL", "TERM", *st.config.get("eb_env_passthrough", [])]
+            env = {k: os.environ[k] for k in keep if k in os.environ}
+            env.update(HOME=str(work), TMPDIR=str(work), PYTHONDONTWRITEBYTECODE="1")
+        cmd = prefix + ["bash", str(work / "evaluator" / "eval.sh"), str(work / "solution")]
         t0 = time.time()
         try:
-            p = subprocess.run(cmd, cwd=work, capture_output=True, text=True, timeout=cfg["timeout"])
+            p = subprocess.run(cmd, cwd=work, capture_output=True, text=True, timeout=cfg["timeout"], env=env)
             out, code = p.stdout + ("\n[stderr]\n" + p.stderr if p.stderr else ""), p.returncode
         except subprocess.TimeoutExpired as e:
             out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
@@ -93,7 +145,29 @@ def _run_eval(st: Store, d: Path, cfg: dict, sol_dir: Path, ev: str) -> dict:
     scores = SCORE_RE.findall(out)
     score = float(scores[-1]) if scores and code == 0 else None
     metrics = {k: v for k, v in METRIC_RE.findall(out)}
-    return {"score": score, "exit": code, "seconds": dur, "metrics": metrics, "log": out}
+    return {"score": score, "exit": code, "seconds": dur, "metrics": metrics, "sandbox": mode, "log": out}
+
+
+def _alloc_solution(d: Path) -> tuple[str, Path]:
+    """Claim the next solution id atomically (exclusive mkdir), so parallel Proposal Agents never collide."""
+    sols = d / "solutions"
+    sols.mkdir(exist_ok=True)
+    n = len(list(sols.iterdir())) + 1
+    while True:
+        sid = f"s{n:04d}"
+        try:
+            (sols / sid).mkdir()
+            return sid, sols / sid
+        except FileExistsError:
+            n += 1
+
+
+def _append_result(d: Path, rec: dict) -> None:
+    import fcntl
+    with open(d / "results.jsonl", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)  # concurrent submitters must not interleave records
+        f.write(json.dumps(rec) + "\n")
+        f.flush()
 
 
 def eb_submit(st: Store, name: str, solution: str, parents: list[str], note: str) -> None:
@@ -102,17 +176,13 @@ def eb_submit(st: Store, name: str, solution: str, parents: list[str], note: str
     src = Path(solution).expanduser().resolve()
     if not (src / "solve.sh").exists():
         raise HyraError("a solution is a directory with solve.sh as its entry point")
-    sid = f"s{cfg['next_id']:04d}"
-    cfg["next_id"] += 1
-    _save(d, cfg)
-    dest = d / "solutions" / sid
-    shutil.copytree(src, dest, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+    sid, dest = _alloc_solution(d)
+    shutil.copytree(src, dest, ignore=shutil.ignore_patterns(".git", "__pycache__"), dirs_exist_ok=True)
     r = _run_eval(st, d, cfg, dest, cfg["evaluator"])
     (dest / "_eval.log").write_text(r.pop("log"))
     rec = {"id": sid, "evaluator": cfg["evaluator"], "parents": parents, "note": note, "author": me(),
            "created": now(), **r}
-    with open(d / "results.jsonl", "a") as f:
-        f.write(json.dumps(rec) + "\n")
+    _append_result(d, rec)
     best = _best(d, cfg)
     status = "INVALID" if r["score"] is None else f"score {r['score']:g}"
     is_best = best and best["id"] == sid
@@ -208,7 +278,87 @@ def eb_rescore(st: Store, name: str, top: int) -> None:
         (d / "solutions" / r["id"] / f"_eval_{cfg['evaluator']}.log").write_text(res.pop("log"))
         rec = {"id": r["id"], "evaluator": cfg["evaluator"], "parents": r["parents"], "note": f"rescore: {r['note']}",
                "author": me(), "created": now(), **res}
-        with open(d / "results.jsonl", "a") as f:
-            f.write(json.dumps(rec) + "\n")
+        _append_result(d, rec)
         s = "INVALID" if res["score"] is None else f"{res['score']:g}"
         print(f"{r['id']}: {r['evaluator']} {r['score']:g} -> {cfg['evaluator']} {s}")
+
+
+# ---------------------------------------------------------------- inspiration queue (Context Agent -> Proposal Agents)
+def _qdirs(d: Path) -> tuple[Path, Path]:
+    q, c = d / "queue", d / "claimed"
+    q.mkdir(exist_ok=True)
+    c.mkdir(exist_ok=True)
+    return q, c
+
+
+def queue_count(d: Path) -> int:
+    return len(list(_qdirs(d)[0].glob("insp-*.json")))
+
+
+def insp_add(st: Store, name: str, text: str, refs: list[str], files: list[str]) -> None:
+    """A Context Agent adds an inspiration: a self-contained bundle of context (text + solutions + files)."""
+    d = _root(st, name)
+    q, c = _qdirs(d)
+    known = {r["id"] for r in _results(d)}
+    bad = [r for r in refs if r not in known]
+    if bad:
+        raise HyraError(f"unknown solution id(s): {', '.join(bad)}")
+    for _ in range(50):  # unique id even with concurrent writers
+        n = len(list(q.glob("insp-*.json"))) + len(list(c.glob("insp-*.json"))) + 1
+        path = q / f"insp-{n:04d}.json"
+        try:
+            with open(path, "x") as f:
+                json.dump({"id": path.stem, "created": now(), "author": me(), "text": text, "refs": refs,
+                           "files": [str(Path(x).expanduser().resolve()) for x in files]}, f, indent=2)
+            print(f"queued {path.stem} ({queue_count(d)} waiting)")
+            return
+        except FileExistsError:
+            continue
+    raise HyraError("could not allocate an inspiration id")
+
+
+def insp_take(st: Store, name: str) -> None:
+    """A Proposal Agent atomically claims one inspiration (rename is atomic: no two agents get the same one)."""
+    d = _root(st, name)
+    cfg = _cfg(d)
+    q, c = _qdirs(d)
+    for f in sorted(q.glob("insp-*.json")):
+        try:
+            os.rename(f, c / f.name)
+        except OSError:
+            continue  # someone else took it
+        b = json.loads((c / f.name).read_text())
+        by_id = {r["id"]: r for r in _results(d) if r["evaluator"] == cfg["evaluator"]}
+        print(f"# Inspiration {b['id']} for bank '{name}'\n\nTask: {cfg['task']}\n"
+              f"Evaluator ({cfg['evaluator']}, {cfg['direction']}imize): {d / 'evaluators' / cfg['evaluator'] / 'eval.sh'}\n\n{b['text']}\n")
+        for sid in b["refs"]:
+            r = by_id.get(sid)
+            sc = "invalid" if not r or r["score"] is None else f"{r['score']:g}"
+            print(f"- {sid}: score {sc}, code {d / 'solutions' / sid}, log {d / 'solutions' / sid / '_eval.log'}"
+                  + (f", note: {r['note']}" if r else ""))
+        for x in b["files"]:
+            print(f"- file: {x}")
+        print(f"\nWrite a solution dir with solve.sh, then: hyra eb submit {name} <dir> --parent <sid> --note \"...\"")
+        return
+    print("(queue empty)")
+
+
+def insp_list(st: Store, name: str, show_all: bool) -> None:
+    d = _root(st, name)
+    q, c = _qdirs(d)
+    for label, folder in (("queued", q), ("claimed", c)):
+        if label == "claimed" and not show_all:
+            continue
+        for f in sorted(folder.glob("insp-*.json")):
+            b = json.loads(f.read_text())
+            print(f"{b['id']} [{label}] {b['text'][:110].replace(chr(10), ' ')}")
+
+
+def eb_status(st: Store, name: str) -> None:
+    d = _root(st, name)
+    cfg = _cfg(d)
+    res = [r for r in _results(d) if r["evaluator"] == cfg["evaluator"]]
+    best = _best(d, cfg)
+    print(f"{name}: evaluator {cfg['evaluator']} ({cfg['direction']}imize); {len(res)} submissions under it "
+          f"({len(_results(d))} total); best {best['id'] + ' ' + format(best['score'], 'g') if best else 'none'}; "
+          f"queue {queue_count(d)} waiting")

@@ -12,8 +12,8 @@ import os
 import sys
 from pathlib import Path
 
-from . import books, core, eb
-from .store import HyraError, Store, die, skill_dir
+from . import books, core, eb, wiki
+from .store import HyraError, Store, die, find_root, skill_dir
 
 
 
@@ -39,7 +39,17 @@ def build() -> argparse.ArgumentParser:
                    "default $HYRA_AGENT or 'overall'")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("setup", help="install hyra skills into every agent harness on this machine + CLI on PATH")
+    s = sub.add_parser("setup", help="install the CLI (--cli) or the skills toolkit (--toolkit local|global)")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--cli", action="store_true", help="put `hyra` on PATH")
+    g.add_argument("--toolkit", choices=["local", "global"],
+                   help="skills for agent harnesses: local = this project (copied), global = every harness on this machine (linked)")
+    s.add_argument("--project", help="local toolkit: project dir (default: cwd)")
+    s.add_argument("--skills", help="comma list, e.g. hyra,hyra-retro (default: all; hyra is always included)")
+    s.add_argument("--mode", choices=["copy", "link"], help="default: copy for local, link for global")
+    s.add_argument("--all-harnesses", action="store_true", help="local: also create .claude/ and .qwen/ even if not detected")
+    s.add_argument("--no-cli", action="store_true", help="toolkit: don't install the CLI when it's missing")
+    s.add_argument("--agents-only", action="store_true", help="toolkit: only register the named agent files (hyra-worker, ...) for the harnesses that read them; leave skills alone (use after `npx skills add`)")
     s.add_argument("--bin-dir"); s.add_argument("--uninstall", action="store_true")
     s = sub.add_parser("init", help="create .hyra/ in the current directory")
     s.add_argument("--project", default="")
@@ -61,7 +71,9 @@ def build() -> argparse.ArgumentParser:
     s = m.add_parser("set"); s.add_argument("slug"); s.add_argument("--status", choices=["active", "paused"])
     s.add_argument("--priority", type=int)
     s = m.add_parser("wake", help="schedule the mission's next wake-up"); s.add_argument("slug")
-    s.add_argument("--at", required=True, help="+30m, +2h, +1d or ISO time"); s.add_argument("--reason", required=True)
+    s.add_argument("--at", help="+30m, +2h, +1d or ISO time (fallback deadline if a condition is given; default 24h)")
+    s.add_argument("--until-file", help="wake as soon as this path exists"); s.add_argument("--until-cmd", help="wake as soon as this shell command exits 0")
+    s.add_argument("--reason", required=True)
     s = m.add_parser("close"); s.add_argument("slug"); s.add_argument("--conclusion", required=True)
     s.add_argument("--accept-unreviewed", action="store_true")
 
@@ -83,7 +95,10 @@ def build() -> argparse.ArgumentParser:
     s = t.add_parser("claim"); s.add_argument("id", type=_tid); s.add_argument("--worker", default=None)
     s = t.add_parser("note", help="append to the task's action log"); s.add_argument("id", type=_tid); s.add_argument("text")
     s = t.add_parser("sleep", help="park the task until a time; it is resumed afterwards")
-    s.add_argument("id", type=_tid); s.add_argument("--until", required=True); s.add_argument("--reason", required=True)
+    s.add_argument("id", type=_tid); s.add_argument("--until", help="+2h or ISO time (fallback deadline if a condition is given; default 24h)")
+    s.add_argument("--until-file", help="resume as soon as this path exists (e.g. a job's output)")
+    s.add_argument("--until-cmd", help="resume as soon as this shell command exits 0 (e.g. a finished-job check)")
+    s.add_argument("--reason", required=True)
     s = t.add_parser("complete"); s.add_argument("id", type=_tid); s.add_argument("--summary", required=True)
     s.add_argument("--evidence", action="append", default=[], help="path | commit:REV | url:... | eb:name/sid | task:N (repeatable)")
     s.add_argument("--no-evidence", action="store_true")
@@ -99,6 +114,8 @@ def build() -> argparse.ArgumentParser:
     s = b.add_parser("post"); s.add_argument("--type", choices=core.BOARD_TYPES, required=True)
     s.add_argument("text"); s.add_argument("--mission"); s.add_argument("--task", type=_tid)
     s.add_argument("--ref", action="append", default=[])
+    s = b.add_parser("ideas", help="ideas on the board and whether each is untested / testing / handled")
+    s.add_argument("--mission"); s.add_argument("--all", action="store_true", help="include handled ideas")
     s = b.add_parser("read"); s.add_argument("--mission"); s.add_argument("--since", type=int, default=0)
     s.add_argument("--type", action="append"); s.add_argument("--limit", type=int, default=30)
 
@@ -132,8 +149,12 @@ def build() -> argparse.ArgumentParser:
 
     # memory
     mm = sub.add_parser("memory", help="per-agent hierarchical working memory").add_subparsers(dest="sub", required=True)
-    s = mm.add_parser("show"); s.add_argument("agent", nargs="?")
-    s = mm.add_parser("path"); s.add_argument("agent", nargs="?")
+    s = mm.add_parser("show", help="level 0 + the tree of nodes, or one node with --node"); s.add_argument("agent", nargs="?")
+    s.add_argument("--node", help="relative path from `hyra memory tree`, e.g. hypotheses/lr-warmup.md")
+    s = mm.add_parser("tree", help="list level-1 nodes with their one-line summaries"); s.add_argument("agent", nargs="?")
+    s = mm.add_parser("note", help="create or rewrite a level-1 node"); s.add_argument("section", choices=["understanding", "hypotheses", "ruled-out", "next"])
+    s.add_argument("title"); s.add_argument("--text", required=True); s.add_argument("--summary", default=""); s.add_argument("--agent")
+    s = mm.add_parser("path", help="path of the level-0 index to edit"); s.add_argument("agent", nargs="?")
 
     # books
     k = sub.add_parser("books", help="shared knowledge base (observation / verified / convention)").add_subparsers(dest="sub", required=True)
@@ -158,6 +179,35 @@ def build() -> argparse.ArgumentParser:
     sk.add_parser("list")
     s = sk.add_parser("publish"); s.add_argument("name")
 
+    # config and diagnostics
+    cf = sub.add_parser("config", help="show / set / validate configuration (defaults < ~/.hyra/config.json < project)").add_subparsers(dest="sub", required=True)
+    cf.add_parser("show"); cf.add_parser("validate"); cf.add_parser("path")
+    s = cf.add_parser("set"); s.add_argument("key", help="e.g. harness, overall_agent, harness_models.opencode"); s.add_argument("value", help="JSON or plain text")
+    s.add_argument("--user", action="store_true", help="write ~/.hyra/config.json (machine-wide) instead of the project"); s.add_argument("--force", action="store_true")
+    s = cf.add_parser("unset"); s.add_argument("key"); s.add_argument("--user", action="store_true")
+    sub.add_parser("doctor", help="check what's installed and configured, and what to do next")
+
+    # ledger server
+    sv = sub.add_parser("server", help="optional ledger server: sealed claims, server-side blind review, human-only approvals").add_subparsers(dest="sub", required=True)
+    s = sv.add_parser("serve", help="run the ledger (on another machine, e.g. a tailnet device)")
+    s.add_argument("--data", default="~/.hyra-server"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=7421)
+    s.add_argument("--no-print-tokens", action="store_true", help="write first-run tokens to <data>/initial-tokens.txt only (for services: keeps them out of the journal)")
+    s.add_argument("--rotate-tokens", action="store_true", help="revoke the human and runner tokens and mint new ones, then serve")
+    s = sv.add_parser("connect", help="point this project at a ledger"); s.add_argument("--url", required=True); s.add_argument("--project")
+    sv.add_parser("status")
+    s = sv.add_parser("token", help="mint a token for an interactive session (needs the human token)")
+    s.add_argument("--role", required=True, choices=["overall", "mission", "worker", "reviewer", "retrospective"]); s.add_argument("--scope", default="")
+
+    # wiki bridge
+    w = sub.add_parser("wiki", help="optional bridge to an llm-obsidian-wiki (Karpathy LLM wiki) vault").add_subparsers(dest="sub", required=True)
+    s = w.add_parser("setup"); s.add_argument("--vault", required=True); s.add_argument("--cluster", default="hyra")
+    s = w.add_parser("search", help="read-only search of the vault's wiki/"); s.add_argument("query")
+    s.add_argument("--limit", type=int, default=8); s.add_argument("--all", action="store_true", help="include deprecated/superseded")
+    s.add_argument("--drafts", action="store_true", help="include wiki/_drafts")
+    s = w.add_parser("show"); s.add_argument("page")
+    s = w.add_parser("export", help="verified/convention Books entry -> wiki/_drafts (needs approval)")
+    s.add_argument("id"); s.add_argument("--type", choices=["concept", "decision", "comparison", "synthesis"], default="concept")
+
     # experience banks
     e = sub.add_parser("eb", help="Hyra 1.0 score-driven loop (Experience Bank) as a tool").add_subparsers(dest="sub", required=True)
     s = e.add_parser("init"); s.add_argument("name"); s.add_argument("--evaluator", required=True, help="eval.sh or dir containing it")
@@ -171,12 +221,32 @@ def build() -> argparse.ArgumentParser:
     s.add_argument("--new", required=True); s.add_argument("--note", required=True)
     s = e.add_parser("rescore"); s.add_argument("name"); s.add_argument("--top", type=int, default=5)
     s = e.add_parser("list")
+    s = e.add_parser("status"); s.add_argument("name")
+    ins = e.add_parser("inspiration", help="the queue between the Context Agent and Proposal Agents").add_subparsers(dest="isub", required=True)
+    s = ins.add_parser("add"); s.add_argument("name"); s.add_argument("--text", required=True)
+    s.add_argument("--ref", action="append", default=[], help="solution id (repeatable)"); s.add_argument("--file", action="append", default=[])
+    s = ins.add_parser("take"); s.add_argument("name")
+    s = ins.add_parser("list"); s.add_argument("name"); s.add_argument("--all", action="store_true")
+    s = e.add_parser("loop", help="run the autonomous Hyra 1.0 pipeline: Context Agent + parallel Proposal Agents + sandboxed scoring")
+    s.add_argument("name"); s.add_argument("--proposers", type=int, default=3, help="max concurrent Proposal Agents (the semaphore)")
+    s.add_argument("--max-submissions", type=int, default=30); s.add_argument("--minutes", type=float, default=60)
+    s.add_argument("--target", type=float, help="stop when the best score reaches this")
+    s.add_argument("--patience", type=int, default=0, help="stop after this many submissions without improvement")
+    s.add_argument("--queue-low", type=int, default=2); s.add_argument("--per-round", type=int, default=4, help="inspirations the Context Agent adds per wake-up")
+    s.add_argument("--rounds", type=int, default=1, help=">1 = bilevel: an Evaluator Agent may upgrade the evaluator between rounds")
+    s.add_argument("--harness"); s.add_argument("--model"); s.add_argument("--poll", type=float, default=3.0)
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--create-evaluator", action="store_true", help="bank doesn't exist yet: an Evaluator Agent writes eval.sh from --task")
+    s.add_argument("--task", help="with --create-evaluator"); s.add_argument("--direction", choices=["max", "min"], default="max")
+    s.add_argument("--timeout", type=int, default=600)
 
     # runner
     s = sub.add_parser("run", help="scheduler: launch headless Mission/Worker sessions and keep them moving")
     s.add_argument("--max-workers", type=int); s.add_argument("--once", action="store_true")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--task", type=_tid, help="launch just this task in a fresh headless session and wait for it")
+    s.add_argument("--mission", help="launch just this Mission in its own fresh headless session and wait for it")
+    s.add_argument("--overall", action="store_true", help="run one unattended Overall session now and wait for it")
     s.add_argument("--harness", help="override the harness for this run"); s.add_argument("--model")
     return p
 
@@ -198,11 +268,11 @@ def main(argv=None) -> None:
 def dispatch(a) -> None:
     if a.cmd == "init":
         st = Store.init(Path.cwd(), a.project or Path.cwd().name, a.goal)
-        print(f"initialized Hyra project at {st.dir}\nedit {st.dir/'config.json'} for resources, approval rules and the agent command")
+        print(f"initialized Hyra project at {st.dir}\nsee `hyra config show` for what applies; `hyra config set <key> <value>` to change it (resources, approval rules, harness, ...)")
         return
     if a.cmd == "setup":
         from .install import setup
-        setup(a.bin_dir, a.uninstall)
+        setup(a)
         return
     if a.cmd == "guide":
         print((skill_dir() / "SKILL.md").read_text())
@@ -222,6 +292,29 @@ def dispatch(a) -> None:
         books.skill_list(st)
         return
 
+    if a.cmd in ("doctor", "config"):  # work with or without a project
+        from . import doctor as dr
+        try:
+            root = find_root()
+        except HyraError:
+            root = None
+        if a.cmd == "doctor":
+            dr.doctor()
+        elif a.sub == "show":
+            dr.config_show(root)
+        elif a.sub == "set":
+            dr.config_set(root, a.key, a.value, a.user, a.force)
+        elif a.sub == "unset":
+            dr.config_unset(root, a.key, a.user)
+        elif a.sub == "validate":
+            dr.config_validate(root)
+        else:
+            print(f"user:    {dr.user_config_path()}\nproject: {root / '.hyra' / 'config.json' if root else '(not in a project)'}")
+        return
+    if a.cmd == "server" and a.sub == "serve":
+        from .server import serve
+        serve(a.data, a.host, a.port, a.no_print_tokens, a.rotate_tokens)
+        return
     st = Store.open()
     agent = core.me()
     c, s = a.cmd, getattr(a, "sub", None)
@@ -234,7 +327,7 @@ def dispatch(a) -> None:
          "list": lambda: core.mission_list(st, a.all),
          "show": lambda: core.mission_show(st, a.slug),
          "set": lambda: core.mission_set(st, a.slug, a.status, a.priority),
-         "wake": lambda: core.mission_wake(st, a.slug, a.at, a.reason),
+         "wake": lambda: core.mission_wake(st, a.slug, a.at, a.reason, a.until_file, a.until_cmd),
          "close": lambda: core.mission_close(st, a.slug, a.conclusion, a.accept_unreviewed)}[s]()
     elif c == "task":
         if s == "add":
@@ -254,7 +347,7 @@ def dispatch(a) -> None:
         elif s == "note":
             core.task_note(st, a.id, a.text)
         elif s == "sleep":
-            core.task_sleep(st, a.id, a.until, a.reason)
+            core.task_sleep(st, a.id, a.until, a.reason, a.until_file, a.until_cmd)
         elif s == "complete":
             core.task_complete(st, a.id, a.summary, a.evidence, a.no_evidence)
         elif s == "evidence":
@@ -269,6 +362,12 @@ def dispatch(a) -> None:
     elif c == "board":
         if s == "post":
             core.board_post(st, a.type, a.text, a.mission, a.task, a.ref)
+        elif s == "ideas":
+            rows = [(i, st_) for i, st_ in core.idea_states(st, a.mission) if a.all or st_ != "handled"]
+            for i, st_ in rows:
+                print(f"#{i['id']} [{st_}] ({i['mission'] or 'no mission'}) {i['author']}: {i['text']}")
+            if not rows:
+                print("(no open ideas)")
         else:
             core.board_read(st, a.mission, a.since, a.type, a.limit)
     elif c == "msg":
@@ -294,7 +393,11 @@ def dispatch(a) -> None:
     elif c == "memory":
         who = a.agent or agent
         if s == "show":
-            core.memory_show(st, who)
+            core.memory_show(st, who, a.node)
+        elif s == "tree":
+            core.memory_tree(st, who)
+        elif s == "note":
+            core.memory_note(st, who, a.section, a.title, a.text, a.summary)
         else:
             p = st.memory_path(who)
             if not p.exists():
@@ -310,6 +413,33 @@ def dispatch(a) -> None:
             books.books_revise(st, a.id, a.note, a.evidence, a.demote)
         elif s == "sync":
             books.books_sync(st, a.id)
+    elif c == "server":
+        from . import remote
+        if s == "connect":
+            import uuid
+            cfg_path = st.dir / "config.json"
+            cfg = json.loads(cfg_path.read_text())
+            cfg["server"] = {"url": a.url.rstrip("/"), "project": a.project or (cfg.get("server") or {}).get("project") or uuid.uuid4().hex}
+            cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+            st.config["server"] = cfg["server"]
+            print(f"project connected to {cfg['server']['url']} as project {cfg['server']['project']}: {remote.call(st, 'GET', '/v1/health')}")
+            print("From now on: claims are sealed on the server, blind review and approvals are enforced there. "
+                  "Start the scheduler with HYRA_RUNNER_TOKEN set; decide approvals with the human token.")
+        elif s == "status":
+            print(f"server: {st.config.get('server') or 'not configured (local mode)'}")
+            if remote.enabled(st):
+                print(f"health: {remote.call(st, 'GET', '/v1/health')}")
+        elif s == "token":
+            print(remote.mint_for_human(st, a.role, a.scope))
+    elif c == "wiki":
+        if s == "setup":
+            wiki.setup(st, a.vault, a.cluster)
+        elif s == "search":
+            wiki.search(st, a.query, a.limit, a.all, a.drafts)
+        elif s == "show":
+            wiki.show(st, a.page)
+        elif s == "export":
+            wiki.export(st, a.id, a.type)
     elif c == "skill":
         if s == "new":
             books.skill_new(st, a.name, a.description, [x for x in a.from_books.split(",") if x])
@@ -328,6 +458,21 @@ def dispatch(a) -> None:
             eb.eb_evaluator(st, a.name, a.new, a.note)
         elif s == "rescore":
             eb.eb_rescore(st, a.name, a.top)
+        elif s == "status":
+            eb.eb_status(st, a.name)
+        elif s == "inspiration":
+            {"add": lambda: eb.insp_add(st, a.name, a.text, a.ref, a.file), "take": lambda: eb.insp_take(st, a.name),
+             "list": lambda: eb.insp_list(st, a.name, a.all)}[a.isub]()
+        elif s == "loop":
+            from .ebloop import EbLoop
+            lp = EbLoop(st, a.name, proposers=a.proposers, max_submissions=a.max_submissions, minutes=a.minutes,
+                        target=a.target, patience=a.patience, queue_low=a.queue_low, per_round=a.per_round,
+                        harness=a.harness, model=a.model, rounds=a.rounds, poll=a.poll, dry=a.dry_run)
+            if not (st.dir / "eb" / a.name / "eb.json").exists():
+                if not (a.create_evaluator and a.task):
+                    raise HyraError(f"no bank {a.name!r}: `hyra eb init` it, or pass --create-evaluator --task \"...\"")
+                lp.create_evaluator(a.task, a.direction, a.timeout)
+            lp.run()
         elif s == "list":
             for d in sorted((st.dir / "eb").glob("*/eb.json")):
                 cfg = json.loads(d.read_text())
@@ -335,7 +480,7 @@ def dispatch(a) -> None:
     elif c == "run":
         from .runner import Runner
         r = Runner(st, a.max_workers, a.dry_run, a.harness, a.model)
-        r.run_one(a.task) if a.task else r.loop(a.once or a.dry_run)
+        r.run_one(a.task) if a.task else r.run_mission(a.mission) if a.mission else r.run_overall() if a.overall else r.loop(a.once or a.dry_run)
 
 
 if __name__ == "__main__":
