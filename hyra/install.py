@@ -12,9 +12,15 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import subprocess
+import sys
+import tempfile
+import zipapp
+import zipfile
 from pathlib import Path
 from typing import Optional
 
+from . import __version__
 from .store import HyraError, skill_dir
 
 
@@ -173,20 +179,130 @@ def _remove(dest: Path, out: list[str]) -> None:
         out.append(f"removed {dest}")
 
 
-def install_cli(bindir: Path, uninstall: bool, only_if_missing: bool) -> None:
-    cli = skill_dir() / "scripts" / "hyra"
-    dest = bindir / "hyra"
+# ---------------------------------------------------------------------------------------------- the global CLI
+# The `hyra` command is the one thing that is installed machine-wide, whatever way the skills were installed (per project
+# or globally): a single self-contained copy in ~/.hyra/cli/hyra, linked from ~/.local/bin/hyra. Deleting a repo can't break
+# it, and a repo's skills can be older or newer than it, which is what the version check below is for.
+def cli_home() -> Path:
+    return Path(os.environ.get("HYRA_CLI_HOME") or Path.home() / ".hyra" / "cli")
+
+
+def parse_version(text: Optional[str]) -> Optional[tuple]:
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def running_pyz() -> Optional[Path]:
+    """The bundle file this process is running from, if it is one (the global CLI, or a skill folder's hyra.pyz)."""
+    for parent in Path(__file__).resolve().parents:
+        if parent.is_file() and zipfile.is_zipfile(parent):
+            return parent
+    return None
+
+
+def bundle_bytes() -> bytes:
+    """This exact version of hyra as one self-contained file: the running bundle, or one built from the source tree."""
+    rp = running_pyz()
+    if rp:
+        return rp.read_bytes()
+    with tempfile.TemporaryDirectory() as tmp:
+        shutil.copytree(Path(__file__).parent, Path(tmp) / "hyra", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        out = Path(tmp) / "b.pyz"
+        zipapp.create_archive(tmp, out, interpreter="/usr/bin/env python3", main="hyra.cli:main", compressed=True)
+        return out.read_bytes()
+
+
+def current_cli_dir() -> Optional[Path]:
+    """A directory holding an executable `hyra` of the SAME version as this process, for agent sessions' PATH (so a session
+    never runs a different version than the scheduler that launched it)."""
+    env = os.environ.get("HYRA_CLI_DIR")
+    if env:
+        return Path(env)
+    rp = running_pyz()
+    return rp.parent if rp and (rp.parent / "hyra").exists() else None
+
+
+def installed_cli(bindir: Optional[Path] = None) -> dict:
+    """The `hyra` on PATH; failing that, our own global copy (installed, but its bin dir isn't on PATH yet)."""
+    path = shutil.which("hyra")
+    on_path = bool(path)
+    if not path:
+        for cand in ([bindir / "hyra"] if bindir else []) + [cli_home() / "hyra"]:
+            if cand.exists():
+                path = str(cand)
+                break
+    if not path:
+        return {"path": None, "version": None, "on_path": False}
+    try:
+        r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+        return {"path": path, "version": parse_version(r.stdout + r.stderr) if r.returncode == 0 else None, "on_path": on_path}
+    except (OSError, subprocess.TimeoutExpired):
+        return {"path": path, "version": None, "on_path": on_path}
+
+
+def cli_state(inst: dict) -> str:
+    mine, have = parse_version(__version__), inst["version"]
+    if not inst["path"]:
+        return "missing"
+    if have is None:
+        return "upgrade"  # an older hyra that can't even report its version
+    return "ok" if have == mine else "upgrade" if have < mine else "newer"
+
+
+def install_cli(bindir: Path, uninstall: bool, only_if_missing: bool, check: bool = False, force: bool = False) -> None:
+    """Put this version of hyra at ~/.hyra/cli/hyra and link it from <bindir>/hyra. `check` only reports; an explicit install
+    upgrades an older or unknown one (the command is the consent) but won't downgrade a newer one without --force."""
+    home, dest = cli_home(), bindir / "hyra"
+    inst = installed_cli(bindir)
+    state = cli_state(inst)
+    have = ".".join(map(str, inst["version"])) if inst["version"] else "an older version with no version number"
+    msgs = {"missing": "missing: `hyra` is not on this machine yet",
+            "ok": f"ok ({__version__} at {inst['path']})",
+            "upgrade": f"upgrade-available: installed {have} at {inst['path']}; these skills carry {__version__}",
+            "newer": f"newer: installed {have} at {inst['path']} is newer than these skills ({__version__}); update the skills instead"}
+    # an install that is just a link into some repo's skill folder: right version today, breaks when that repo moves or is deleted
+    repo_linked = state == "ok" and dest.is_symlink() and home.resolve() not in Path(os.path.realpath(dest)).parents
+    if check:
+        print(f"hyra-cli: {msgs[state]}" + (f"; but {dest} is a link into a repo, so it breaks if that repo moves: run `setup --cli` to make it independent" if repo_linked else ""))
+        return
     out: list[str] = []
     if uninstall:
-        if dest.is_symlink() and Path(os.readlink(dest)) == cli:
+        if dest.is_symlink() and home.resolve() in Path(os.path.realpath(dest)).parents:
             dest.unlink()
             out.append(f"removed {dest}")
-    elif only_if_missing and shutil.which("hyra"):
-        out.append(f"cli     already installed at {shutil.which('hyra')}")
+        for f in ("hyra", "VERSION"):
+            if (home / f).exists():
+                (home / f).unlink()
+                out.append(f"removed {home / f}")
+    elif only_if_missing and state != "missing":
+        out.append(f"cli     {msgs[state]}" + ("; run `hyra setup --cli` to upgrade (ask the user first)" if state == "upgrade" else ""))
+    elif state == "ok" and not repo_linked:
+        out.append(f"cli     already up to date: {msgs['ok']}" + ("" if inst.get("on_path", True) else f"\nnote: {bindir} is not on your PATH yet"))
+    elif state == "newer" and not force:
+        out.append(f"cli     not downgrading: {msgs['newer']} (or pass --force)")
     else:
-        _link(cli, dest, out)
+        home.mkdir(parents=True, exist_ok=True)
+        tmp = home / "hyra.new"
+        tmp.write_bytes(bundle_bytes())
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, home / "hyra")
+        (home / "VERSION").write_text(__version__ + "\n")
+        bindir.mkdir(parents=True, exist_ok=True)
+        # replace a link, or a regular file only when it IS the older hyra we just identified (or --force); never some other tool
+        old_is_here = bool(inst["path"]) and Path(inst["path"]) == dest
+        if dest.is_symlink() or (dest.exists() and (force or old_is_here)):
+            dest.unlink()
+        if dest.exists():
+            out.append(f"skip    {dest} exists and is not a symlink (--force to replace)")
+        else:
+            dest.symlink_to(home / "hyra")
+        out.append(f"installed hyra {__version__} at {home / 'hyra'} (linked from {dest})" + (f"; it replaced {have}" if state == "upgrade" else
+                   "; it was a link into a repo, now independent of any repo" if repo_linked else ""))
+        first = shutil.which("hyra")
         if str(bindir) not in os.environ.get("PATH", "").split(os.pathsep):
-            out.append(f"note: add {bindir} to PATH (or call {cli} directly)")
+            out.append(f"note: add {bindir} to PATH")
+        elif first and os.path.realpath(first) != os.path.realpath(home / "hyra"):
+            out.append(f"WARNING: another hyra earlier on PATH ({first}) still shadows this one; remove it or put {bindir} first")
     print("\n".join(out) or "nothing to do")
 
 
@@ -262,4 +378,4 @@ def setup(args) -> None:
                 install_cli(bindir, False, only_if_missing=True)
             print("done. Ask your agent to use the hyra skill (Claude Code: /hyra <goal>).")
     else:
-        install_cli(bindir, args.uninstall, only_if_missing=False)
+        install_cli(bindir, args.uninstall, only_if_missing=False, check=getattr(args, "check", False), force=getattr(args, "force", False))

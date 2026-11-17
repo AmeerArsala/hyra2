@@ -31,6 +31,9 @@ def build() -> str:
         zipapp.create_archive(tmp, OUT, interpreter="/usr/bin/env python3", main="hyra.cli:main", compressed=True)
     digest = source_hash()
     OUT.with_name("hyra.pyz.sha256").write_text(digest + "\n")
+    sys.path.insert(0, str(ROOT))
+    from hyra import __version__
+    OUT.with_name("hyra.pyz.version").write_text(__version__ + "\n")  # lets a newer CLI notice that this folder carries a newer bundle
     return digest
 
 

@@ -168,14 +168,8 @@ def auto_select(preferred: list[str], any_owner: bool = False, say=print) -> tup
 
 # ------------------------------------------------------------------------------------------------ the bundle
 def bundle_bytes() -> bytes:
-    pyz = skill_dir() / "scripts" / "hyra.pyz"
-    if pyz.exists():
-        return pyz.read_bytes()
-    with tempfile.TemporaryDirectory() as tmp:  # running from a source checkout without a built bundle
-        shutil.copytree(Path(__file__).parent, Path(tmp) / "hyra", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        out = Path(tmp) / "b.pyz"
-        zipapp.create_archive(tmp, out, interpreter="/usr/bin/env python3", main="hyra.cli:main", compressed=True)
-        return out.read_bytes()
+    from .install import bundle_bytes as _bundle  # the running version of hyra, as one file
+    return _bundle()
 
 
 # ------------------------------------------------------------------------------------------------ remote facts and services

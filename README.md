@@ -42,9 +42,13 @@ under `hyra/`, run `python3 scripts/build_bundle.py`; a test fails if the bundle
 
 ### On a fresh repo or machine (e.g. via skills.sh)
 
-`npx skills add <owner>/<repo>` (all skills) copies the skill folders, and **that's all you do**. skills.sh has no post-install hook,
-so the skill handles the rest itself on first use: the agent runs `setup --cli` (one symlink in `~/.local/bin`) and tells you. The CLI
-is bundled in the skill folder, so the only requirement is Python 3.9+. Everything else is optional:
+`npx skills add <owner>/<repo>` (all skills) copies the skill folders into the repo (project-level by default; `-g` for one global
+copy), and **that's all you do**. skills.sh has no post-install hook, so the skill handles the rest itself at the start of a session:
+it runs `setup --cli --check`. **The CLI is the one global piece, whichever way the skills were installed**: a single self-contained
+copy in `~/.hyra/cli/`, linked from `~/.local/bin/hyra`, so deleting a repo never breaks it and every repo uses the same one.
+If the skills carry a newer version than the global one (say, an older hyra from your other computers), the agent tells you and **asks
+before upgrading**; it never downgrades a newer global hyra, and installing skills never upgrades behind your back. The only
+requirement is Python 3.9+. Everything else is optional:
 
 | | what | how |
 |---|---|---|
@@ -55,7 +59,7 @@ is bundled in the skill folder, so the only requirement is Python 3.9+. Everythi
 | 5 | wiki web capture | `defuddle-cli`, `trafilatura`, `yt-dlp` (the wiki scripts need `bash`, `git`, `python3`) |
 | 6 | "named agents" | **skip this.** Some tools (Claude Code, OpenCode, Antigravity, omp) let you save helper agents as files so a chat can say "use hyra-worker". `hyra setup --toolkit global --agents-only` writes those files. Without them hyra pastes the same instructions into each prompt, which works everywhere and is what was tested most |
 
-Run **`hyra doctor`** anywhere: it checks Python, the CLI on PATH, the skills in every harness's folder, which agent CLIs actually run
+Run **`hyra doctor`** anywhere: it checks Python, the global CLI and its version, the skills in every harness's folder, which agent CLIs actually run
 (not just exist on PATH), the scoring sandbox, and, inside a project, config problems, the ledger server and tokens, and says what to do.
 **`hyra config show|set|unset|validate`** manages the layers (built-in defaults < `~/.hyra/config.json` < `<project>/.hyra/config.json`) and
 catches typos (`overal_agent` is rejected with "did you mean `overall_agent`?"). `hyra init` writes only the project's name (and the ledger connection), so

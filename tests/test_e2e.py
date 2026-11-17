@@ -24,7 +24,8 @@ class E2E(unittest.TestCase):
         fake = Path(self.tmp.name) / "fakehome"  # tests must never see (or touch) the real home's installed agents
         fake.mkdir()
         self.env.update(HOME=str(fake), XDG_CONFIG_HOME=str(fake / ".config"), KIMI_CODE_HOME=str(fake / ".kimi-code"),
-                        HYRA_TAILSCALE_BIN="")  # tests never look at (or probe) the real tailnet
+                        HYRA_TAILSCALE_BIN="",  # tests never look at (or probe) the real tailnet
+                        PATH="/usr/bin:/bin:/usr/sbin:/sbin")  # ...nor at the `hyra` (or any other tool) installed on the real machine
         for k in ("HYRA_AGENT", "HYRA_ROLE", "HYRA_TASK", "HYRA_PROJECT"):
             self.env.pop(k, None)
 
@@ -1111,6 +1112,111 @@ echo ok > r.txt; hyra task complete $HYRA_TASK --summary "SEALED-BY-SESSION" --e
         self.h("config", "unset", "bogus_key")
         self.assertIn("config is valid", self.h("config", "validate"))
         self.assertIn("harness_models", self.h("config", "unset", "harness_models.opencode") and self.h("config", "show"))
+
+    def test_global_cli_survives_the_repo_and_upgrades_older_ones(self):
+        """Skills are per repo, the CLI is global: one real copy in ~/.hyra/cli, independent of any repo, with a version check."""
+        home, env = self._home()
+        repo_skills = Path(self.tmp.name) / "repo-a" / ".agents" / "skills"
+        shutil.copytree(Path(HYRA).resolve().parents[2], repo_skills, ignore=shutil.ignore_patterns("__pycache__"))
+        launcher = repo_skills / "hyra" / "scripts" / "hyra"
+        run = lambda *a, **k: subprocess.run([sys.executable, str(launcher), *a], capture_output=True, text=True, cwd=k.get("cwd", self.root),
+                                             env=dict(self.env, **env, **k.get("env", {})))
+        self.assertIn("missing", run("setup", "--cli", "--check").stdout)
+        out = run("setup", "--cli").stdout
+        self.assertIn("installed hyra 0.3.0", out)
+        link, real = home / "bin" / "hyra", home / ".hyra/cli/hyra"
+        self.assertTrue(link.is_symlink() and real.is_file() and not real.is_symlink())            # a real copy, not a link into the repo
+        self.assertEqual(Path(os.path.realpath(link)), real.resolve())
+        self.assertIn("up to date", run("setup", "--cli").stdout)
+        # the repo disappears; the command keeps working everywhere
+        shutil.rmtree(Path(self.tmp.name) / "repo-a")
+        r = subprocess.run([str(link), "--version"], capture_output=True, text=True, env=dict(self.env, **env))
+        self.assertEqual(r.stdout.strip(), "hyra 0.3.0")
+        r = subprocess.run([str(link), "init"], cwd=self.root, capture_output=True, text=True, env=dict(self.env, **env))
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_same_version_link_into_a_repo_is_migrated_to_the_independent_copy(self):
+        home, env = self._home()
+        (home / "bin").mkdir(parents=True)
+        env = dict(env, PATH=f"{home / 'bin'}:/usr/bin:/bin")
+        (home / "bin" / "hyra").symlink_to(HYRA)                                                    # the old layout: a link into the repo
+        out = self.h("setup", "--cli", "--check", env=env)
+        self.assertIn("ok (0.3.0", out); self.assertIn("link into a repo", out)
+        out = self.h("setup", "--cli", env=env)
+        self.assertIn("now independent of any repo", out)
+        self.assertEqual(Path(os.path.realpath(home / "bin" / "hyra")), (home / ".hyra/cli/hyra").resolve())
+        self.assertNotIn("link into a repo", self.h("setup", "--cli", "--check", env=env))
+        self.assertIn("up to date", self.h("setup", "--cli", env=env))
+
+    def test_cli_version_check_detects_older_and_newer_installs(self):
+        home, env = self._home()
+        (home / "bin").mkdir(parents=True)
+        env = dict(env, PATH=f"{home / 'bin'}:/usr/bin:/bin")                                       # `hyra` resolves to what is installed there
+        def stub(body):  # pretend to be an installed hyra
+            f = home / "bin" / "hyra"
+            if f.is_symlink() or f.exists():
+                f.unlink()
+            f.write_text("#!/bin/sh\n" + body + "\n"); f.chmod(0o755)
+        check = lambda: self.h("setup", "--cli", "--check", env=env)
+        stub('echo "usage: hyra [-h]  error: unrecognized arguments: --version" >&2; exit 2')       # an old hyra: no --version at all
+        out = check(); self.assertIn("upgrade-available", out); self.assertIn("older version with no version number", out)
+        stub('echo "hyra 0.2.0"')
+        out = check(); self.assertIn("installed 0.2.0", out); self.assertIn("these skills carry 0.3.0", out)
+        up = self.h("setup", "--cli", env=env)                                                       # explicit command = consent: upgrades
+        self.assertIn("installed hyra 0.3.0", up); self.assertIn("it replaced 0.2.0", up)
+        self.assertIn("ok (0.3.0", check())
+        stub('echo "hyra 9.9.9"')
+        out = check(); self.assertIn("newer: installed 9.9.9", out)
+        self.assertIn("not downgrading", self.h("setup", "--cli", env=env))                         # never silently downgrades
+        self.assertIn("installed hyra 0.3.0", self.h("setup", "--cli", "--force", env=env))
+        # installing the toolkit never upgrades behind your back: it only tells you
+        stub('echo "hyra 0.2.0"')
+        out = self.h("setup", "--toolkit", "local", env=env)
+        self.assertIn("run `hyra setup --cli` to upgrade (ask the user first)", out)
+        self.assertEqual((home / "bin" / "hyra").read_text().count("0.2.0"), 1)                    # still the old one
+
+    def test_local_skills_with_the_global_cli_agents_run_the_same_version(self):
+        """The user's setup: skills local to the repo, `hyra` global. The scheduler's agent sessions must get that same global hyra."""
+        home, env = self._home()
+        self.h("setup", "--cli", env=env)
+        self.h("init")
+        self.h("setup", "--toolkit", "local", "--no-cli", env=env)                                # skills copied into this repo only
+        self.assertTrue((self.root / ".agents/skills/hyra/SKILL.md").exists())
+        self.assertFalse((home / ".agents/skills").exists())                                       # nothing global except the CLI
+        script = 'command -v hyra > where; hyra --version >> where; hyra task complete $HYRA_TASK --summary ok --evidence where'
+        cfg = json.loads((self.root / ".hyra/config.json").read_text())
+        cfg.update(harness="fake", harness_cmds={"fake": ["bash", "-c", script, "{prompt}"]}, max_missions_running=0, overall_agent=False, auto_retro=False)
+        (self.root / ".hyra/config.json").write_text(json.dumps(cfg))
+        self.h("mission", "new", "m1", "--title", "t", "--problem", "p"); self.h("task", "add", "--mission", "m1", "--title", "a", "--spec", "s")
+        full = dict(self.env, **env)
+        r = subprocess.run([str(home / "bin" / "hyra"), "run", "--once"], cwd=self.root, capture_output=True, text=True, env=full)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        where = (self.root / "where").read_text().split("\n")
+        self.assertEqual(Path(where[0]).resolve().parent, (home / ".hyra/cli").resolve())                                # the session's `hyra` is the global one
+        self.assertEqual(where[1], "hyra 0.3.0")
+        self.assertIn("[done]", subprocess.run([str(home / "bin" / "hyra"), "task", "show", "1"], cwd=self.root, capture_output=True, text=True, env=full).stdout)
+
+    def test_a_newer_bundle_in_the_skills_is_announced_by_the_cli(self):
+        home, env = self._home()
+        self.h("setup", "--cli", env=env)                                                          # the installed (global) CLI is 0.3.0
+        skills = Path(self.tmp.name) / "skills-new"
+        shutil.copytree(Path(HYRA).resolve().parents[2], skills, ignore=shutil.ignore_patterns("__pycache__"))
+        (skills / "hyra/scripts/hyra.pyz.version").write_text("0.9.0\n")
+        self.h("init")
+        run = lambda sk: subprocess.run([str(home / "bin" / "hyra"), "status"], cwd=self.root, capture_output=True, text=True,
+                                        env=dict(self.env, **env, HYRA_SKILL_DIR=str(sk / "hyra")))
+        r = run(skills)
+        self.assertIn("these skills carry hyra 0.9.0 but this is 0.3.0", r.stderr)
+        self.assertIn("setup --cli", r.stderr)
+        (skills / "hyra/scripts/hyra.pyz.version").write_text("0.3.0\n")
+        self.assertNotIn("these skills carry", run(skills).stderr)                                  # silent when versions match
+
+    def test_version_numbers_agree(self):
+        import re as _re
+        root = Path(HYRA).resolve().parents[3]
+        init_v = _re.search(r'__version__ = "([^"]+)"', (root / "hyra/__init__.py").read_text()).group(1)
+        self.assertEqual(_re.search(r'^version = "([^"]+)"', (root / "pyproject.toml").read_text(), _re.M).group(1), init_v)
+        self.assertEqual((Path(HYRA).parent / "hyra.pyz.version").read_text().strip(), init_v, "bundle is stale: run scripts/build_bundle.py")
 
     def test_install_cli_only(self):
         home, env = self._home()

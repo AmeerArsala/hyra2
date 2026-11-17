@@ -133,16 +133,21 @@ def doctor() -> None:
 
     print("Environment")
     (ok if sys.version_info >= (3, 9) else warn)(f"python {sys.version.split()[0]} (needs 3.9+)")
-    cli = shutil.which("hyra")
     try:
         launcher = skill_dir() / "scripts" / "hyra"
     except HyraError:
         launcher = None
-    if cli:
-        ok(f"`hyra` is on PATH: {cli}")
+    inst = install.installed_cli()
+    state = install.cli_state(inst)
+    fix = f"python3 {launcher} setup --cli" if launcher else "run `setup --cli` from the hyra skill's scripts/hyra"
+    if state == "ok":
+        ok(f"global hyra {'.'.join(map(str, inst['version']))} at {inst['path']}")
+    elif state == "missing":
+        warn("`hyra` is not on PATH (skills call it by that name)", fix)
+    elif state == "newer":
+        info(f"global hyra {'.'.join(map(str, inst['version']))} is newer than the one running here ({install.__version__}); update the skills (`npx skills update`)")
     else:
-        warn("`hyra` is not on PATH (skills call it by that name)",
-             f"python3 {launcher} setup --cli" if launcher else "run `setup --cli` from the hyra skill's scripts/hyra")
+        warn(f"global hyra at {inst['path']} is older than this one ({install.__version__})", fix + "   (ask first; it replaces the global copy)")
     try:
         mine = install.our_skills()
         names = [p.name for p in mine]

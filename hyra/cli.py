@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import books, core, eb, wiki
+from . import __version__, books, core, eb, wiki
 from .store import HyraError, Store, die, find_root, skill_dir
 
 
@@ -35,6 +35,7 @@ def _res(items: list[str]) -> dict:
 
 def build() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="hyra", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"hyra {__version__}")
     p.add_argument("--as", dest="as_agent", help="act as this agent id (overall, mission:<slug>, task:<id>); "
                    "default $HYRA_AGENT or 'overall'")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -49,6 +50,8 @@ def build() -> argparse.ArgumentParser:
     s.add_argument("--mode", choices=["copy", "link"], help="default: copy for local, link for global")
     s.add_argument("--all-harnesses", action="store_true", help="local: also create .claude/ and .qwen/ even if not detected")
     s.add_argument("--no-cli", action="store_true", help="toolkit: don't install the CLI when it's missing")
+    s.add_argument("--check", action="store_true", help="--cli: only report whether the global hyra is missing / ok / older / newer than these skills")
+    s.add_argument("--force", action="store_true", help="--cli: also replace a newer global hyra or a regular file in the way")
     s.add_argument("--agents-only", action="store_true", help="toolkit: only register the named agent files (hyra-worker, ...) for the harnesses that read them; leave skills alone (use after `npx skills add`)")
     s.add_argument("--bin-dir"); s.add_argument("--uninstall", action="store_true")
     s = sub.add_parser("init", help="create .hyra/ in the current directory")
@@ -279,8 +282,23 @@ def build() -> argparse.ArgumentParser:
     return p
 
 
+def upgrade_notice() -> None:
+    """If the skills this command found carry a newer hyra than the one running, say so once (stderr; agents ask the user)."""
+    try:
+        from .install import parse_version
+        sk = skill_dir()
+        v = (sk / "scripts" / "hyra.pyz.version").read_text().strip()
+        if parse_version(v) and parse_version(v) > parse_version(__version__):
+            print(f"hyra: these skills carry hyra {v} but this is {__version__}. Ask the user, then upgrade: "
+                  f"python3 {sk}/scripts/hyra setup --cli", file=sys.stderr)
+    except Exception:
+        pass
+
+
 def main(argv=None) -> None:
     args = build().parse_args(argv)
+    if args.cmd != "setup":
+        upgrade_notice()
     if args.as_agent:
         os.environ["HYRA_AGENT"] = args.as_agent
         if args.as_agent.startswith("task:"):

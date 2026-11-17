@@ -23,6 +23,7 @@ from typing import Optional
 
 from .core import check_wake_conditions as core_check, fits, ready, retros_pending, task_claim, usage
 from . import remote
+from . import install
 from .install import native_agent_available
 from .store import HyraError, Store, is_due, now, skill_dir
 
@@ -136,7 +137,7 @@ class Runner:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         log = self.st.dir / "logs" / f"{agent_id.replace(':', '_')}-{stamp}.log"
         env = dict(os.environ, HYRA_PROJECT=str(self.st.root), HYRA_AGENT=agent_id, HYRA_ROLE=role,
-                   PATH=f"{skill_dir() / 'scripts'}{os.pathsep}{os.environ.get('PATH', '')}")
+                   PATH=f"{install.current_cli_dir() or (skill_dir() / 'scripts')}{os.pathsep}{os.environ.get('PATH', '')}")
         if task is not None:
             env["HYRA_TASK"] = str(task)
         env.update(extra_env or {})

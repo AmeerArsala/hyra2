@@ -175,7 +175,8 @@ def skill_dir() -> Path:
     for c in cands:
         if (c / "roles" / "worker.md").exists():
             return c.resolve()
-    raise HyraError("can't find the hyra skill folder (roles/*.md); set HYRA_SKILL_DIR")
+    raise HyraError("can't find the hyra skills (roles/*.md): run this inside a repo that has them (`npx skills add`), "
+                    "or install them globally (`npx skills add -g`), or set HYRA_SKILL_DIR")
 
 
 def library_root() -> Path:

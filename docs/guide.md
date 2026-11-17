@@ -35,6 +35,8 @@ hyra doctor                          # something off? it says what
 | | |
 |---|---|
 | `<repo>/.hyra/` | that project's queue, notes, evidence, config |
+| `<repo>/.agents/skills/` (or `~/.agents/skills/` with `-g`) | the skills |
+| `~/.hyra/cli/hyra` + `~/.local/bin/hyra` | the CLI: global, self-contained, one version per machine |
 | `~/.hyra/config.json` | your machine-wide settings (`hyra config show`) |
 | `~/.hyra/ledger.json` | where your ledger is and its tokens (mode 600; treat like an ssh key) |
 | ledger machine `~/.hyra-server/` | the ledger's database (sealed claims, approvals, audit trail) |

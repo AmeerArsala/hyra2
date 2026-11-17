@@ -19,10 +19,16 @@ All durable state lives in `.hyra/` in the research project and is driven by the
 (full reference: [references/cli.md](references/cli.md)). Agent sessions are disposable. Anything
 worth keeping goes into the queue, the Board, memory files, evidence, or Books.
 
-**The CLI:** every command below is `hyra ...`. **First use on a machine:** if `command -v hyra` finds nothing, run
-`python3 <this skill's directory>/scripts/hyra setup --cli` yourself (it only adds a symlink in `~/.local/bin`; tell the user you did),
-then continue with plain `hyra`. Until that works, `python3 <this skill's directory>/scripts/hyra ...` is the same program; it needs
-nothing but Python 3.9+ (the CLI is bundled inside this skill folder).
+**The CLI** is the one thing installed machine-wide (`~/.local/bin/hyra`, a self-contained copy in `~/.hyra/cli/`); these skills may
+be installed per repo, so the two can differ in version. **At the start of a session, before your first `hyra` command, run**
+`python3 <this skill's directory>/scripts/hyra setup --cli --check` and act on its one line:
+- `ok`: carry on with plain `hyra ...` (every command below).
+- `missing`: run `python3 <this skill's directory>/scripts/hyra setup --cli` (installs it; tell the user).
+- `upgrade-available (installed X ... these skills carry Y)`: the user has an older hyra (e.g. from another machine or repo).
+  **Ask them** ("your global hyra is X, these skills need Y; upgrade?"), and on yes run the same `setup --cli`. Don't use the old
+  `hyra` with these skills: the protocols below assume the newer commands.
+- `newer`: their global hyra is newer than these skills. Tell them to update the skills (`npx skills update`); carry on.
+It needs nothing but Python 3.9+ (the CLI is bundled in this skill folder). Everything below writes `hyra` for short.
 
 **Role protocols** (follow the one you're playing; hand them to the agents you dispatch):
 [roles/mission.md](roles/mission.md), [roles/worker.md](roles/worker.md), [roles/reviewer.md](roles/reviewer.md).
