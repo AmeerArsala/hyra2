@@ -34,7 +34,7 @@ from typing import Optional
 PRIVILEGED_READERS = {"human", "mission", "overall", "retrospective"}   # may read any task's claim (they are not blinded)
 SESSION_ROLES = {"worker", "reviewer", "mission", "overall", "retrospective", "context", "proposer", "evaluator"}
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS tokens (hash TEXT PRIMARY KEY, role TEXT, project TEXT, scope TEXT, created TEXT, revoked INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS tokens (hash TEXT PRIMARY KEY, role TEXT, project TEXT, scope TEXT, created TEXT, revoked INTEGER DEFAULT 0, expires TEXT);
 CREATE TABLE IF NOT EXISTS claims (project TEXT, task INTEGER, summary TEXT, finding TEXT, author TEXT, created TEXT, PRIMARY KEY (project, task));
 CREATE TABLE IF NOT EXISTS reviews (project TEXT, review_task INTEGER, target_task INTEGER, phase TEXT DEFAULT 'blind',
     blind_notes TEXT, verdict TEXT, notes TEXT, created TEXT, PRIMARY KEY (project, review_task));
@@ -49,6 +49,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _later(hours: float) -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).replace(microsecond=0).isoformat()
+
+
+SESSION_TTL_HOURS = 24
+
+
 def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -61,6 +69,8 @@ class Ledger:
         self.db = sqlite3.connect(str(self.path), check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        if "expires" not in {r["name"] for r in self.db.execute("PRAGMA table_info(tokens)")}:  # ledgers created before expiry existed
+            self.db.execute("ALTER TABLE tokens ADD COLUMN expires TEXT")
         os.chmod(self.path, 0o600)
 
     def q(self, sql, *a):
@@ -75,13 +85,32 @@ class Ledger:
         with self.lock:
             return self.db.execute(sql, a).lastrowid
 
-    def mint(self, role: str, project: str = "*", scope: str = "") -> str:
+    def mint(self, role: str, project: str = "*", scope: str = "", ttl_hours: Optional[float] = None) -> str:
+        """human and runner tokens don't expire (rotate them with --rotate-tokens); session tokens get a lifetime."""
         tok = f"hyra_{role}_{secrets.token_hex(24)}"
-        self.x("INSERT INTO tokens(hash,role,project,scope,created) VALUES (?,?,?,?,?)", _hash(tok), role, project, scope, _now())
+        exp = _later(ttl_hours) if ttl_hours is not None else None
+        self.x("INSERT INTO tokens(hash,role,project,scope,created,expires) VALUES (?,?,?,?,?,?)", _hash(tok), role, project, scope, _now(), exp)
         return tok
 
     def whoami(self, token: Optional[str]):
-        return self.one("SELECT * FROM tokens WHERE hash=? AND revoked=0", _hash(token)) if token else None
+        row = self.one("SELECT * FROM tokens WHERE hash=? AND revoked=0", _hash(token)) if token else None
+        return row if row and (not row["expires"] or row["expires"] > _now()) else None
+
+    def prune(self, audit_days: float = 180) -> dict:
+        """Housekeeping: drop long-expired/revoked tokens and old audit rows. Claims, reviews and approvals are the project's
+        research record, tiny, and are never deleted automatically."""
+        t = self.x("DELETE FROM tokens WHERE (expires IS NOT NULL AND expires < ?) OR (revoked=1 AND created < ?)", _later(-24), _later(-24 * 7))
+        a = self.x("DELETE FROM audit WHERE ts < ?", _later(-24 * audit_days))
+        with self.lock:
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return {"audit_days": audit_days}
+
+    def stats(self) -> dict:
+        one = lambda sql: self.one(sql)[0]
+        return {"db_bytes": self.path.stat().st_size, "claims": one("SELECT COUNT(*) FROM claims"), "reviews": one("SELECT COUNT(*) FROM reviews"),
+                "approvals": one("SELECT COUNT(*) FROM approvals"), "audit_rows": one("SELECT COUNT(*) FROM audit"),
+                "tokens_live": one("SELECT COUNT(*) FROM tokens WHERE revoked=0 AND (expires IS NULL OR expires > '%s')" % _now()),
+                "tokens_total": one("SELECT COUNT(*) FROM tokens"), "projects": one("SELECT COUNT(DISTINCT project) FROM claims")}
 
     def audit(self, who, project, action, detail=""):
         self.x("INSERT INTO audit VALUES (?,?,?,?,?)", _now(), project, who["role"] if who else "?", action, detail)
@@ -134,6 +163,8 @@ def make_handler(ledger: Ledger):
             if path == "/v1/health":
                 return 200, {"ok": True}
             who = self._who()
+            if path == "/v1/stats" and method == "GET":
+                return 200, ledger.stats()
             proj = self._project(who)
             role, scope = who["role"], who["scope"]
             body = self._body() if method == "POST" else {}
@@ -144,7 +175,8 @@ def make_handler(ledger: Ledger):
                 want = body.get("role", "")
                 if want not in SESSION_ROLES | {"runner"} or (want == "runner" and role != "human"):
                     raise Denied(f"cannot mint role {want!r}")
-                return 200, {"token": ledger.mint(want, proj, str(body.get("scope", "")))}
+                ttl = None if want == "runner" else float(body.get("ttl_hours", SESSION_TTL_HOURS))
+                return 200, {"token": ledger.mint(want, proj, str(body.get("scope", "")), ttl)}
 
             m = re.fullmatch(r"/v1/claims/(\d+)", path)
             if m:
@@ -253,7 +285,38 @@ def make_handler(ledger: Ledger):
     return H
 
 
-def serve(data_dir: str, host: str, port: int, quiet_tokens: bool = False, rotate: bool = False) -> None:
+def dump_sql(data_dir: str) -> str:
+    """A consistent text snapshot of the ledger WITHOUT its tokens (they can be re-minted; hashes don't belong in a backup repo).
+    Uses SQLite's online backup, so it is safe while the server is running (copying the live file or its WAL is not)."""
+    src = sqlite3.connect(str(Path(data_dir).expanduser() / "ledger.db"))
+    snap = sqlite3.connect(":memory:")
+    src.backup(snap)
+    src.close()
+    snap.execute("DROP TABLE IF EXISTS tokens")
+    return "\n".join(snap.iterdump()) + "\n"
+
+
+def restore_sql(data_dir: str, sql_file: str, force: bool = False) -> str:
+    """Build ledger.db from a dump. Refuses to overwrite a ledger that already holds data unless force. With no tokens in the
+    restored database the next `serve` mints fresh human and runner tokens (and `hyra server up` picks them up)."""
+    d = Path(data_dir).expanduser()
+    d.mkdir(parents=True, exist_ok=True)
+    db = d / "ledger.db"
+    if db.exists():
+        have = sqlite3.connect(str(db)).execute("SELECT (SELECT COUNT(*) FROM claims) + (SELECT COUNT(*) FROM approvals)").fetchone()[0]
+        if have and not force:
+            raise SystemExit(f"{db} already holds {have} claims/approvals; refusing to overwrite (use --force)")
+        db.rename(d / f"ledger.db.before-restore-{_now().replace(':', '')}")
+    tmp = sqlite3.connect(str(db))
+    tmp.executescript(Path(sql_file).read_text(encoding="utf-8"))
+    tmp.close()
+    os.chmod(db, 0o600)
+    led = Ledger(d)  # applies any newer schema bits
+    c = led.stats()
+    return f"restored {c['claims']} claims, {c['reviews']} reviews, {c['approvals']} approvals"
+
+
+def serve(data_dir: str, host: str, port: int, quiet_tokens: bool = False, rotate: bool = False, audit_days: float = 180) -> None:
     """quiet_tokens: write the tokens to <data>/initial-tokens.txt (0600) but don't print them (use under systemd, whose
     journal would otherwise keep them). rotate: revoke every human/runner token and mint fresh ones (session tokens stay)."""
     d = Path(data_dir).expanduser()
@@ -273,6 +336,15 @@ def serve(data_dir: str, host: str, port: int, quiet_tokens: bool = False, rotat
             print(f"{'Tokens rotated' if rotate else 'First run'}. Save these now (also in {f}, readable only by you; delete it afterwards):")
             print(f"  human  token (decides approvals; keep it to yourself): {human}")
             print(f"  runner token (for the scheduler; `hyra run` reads HYRA_RUNNER_TOKEN): {runner}")
+    def housekeeping():  # at startup, then every 6 hours
+        import time
+        while True:
+            try:
+                ledger.prune(audit_days)
+            except Exception as e:  # never let cleanup take the server down
+                print(f"housekeeping failed: {e}", flush=True)
+            time.sleep(6 * 3600)
+    threading.Thread(target=housekeeping, daemon=True).start()
     httpd = ThreadingHTTPServer((host, port), make_handler(ledger))
     print(f"hyra ledger listening on http://{host}:{port}  (data: {d})", flush=True)
     try:

@@ -229,6 +229,15 @@ def doctor() -> None:
             have = [n for n in ("HYRA_TOKEN", "HYRA_RUNNER_TOKEN", "HYRA_HUMAN_TOKEN") if os.environ.get(n)]
             info(f"server tokens in this shell: {', '.join(have) or 'none'} (the scheduler needs HYRA_RUNNER_TOKEN; "
                  "approvals need the human token, typed at the prompt)")
+            from . import ledger_deploy as ld
+            ls = ld.load_state()
+            hours = cfg.get("ledger_backup_every_hours")
+            if ls.get("backup_repo") or cfg.get("ledger_backup_remote"):
+                last = ls.get("last_backup") or "never"
+                (ok if ls.get("last_backup") else warn)(f"ledger backup every {6 if hours is None else hours}h to {cfg.get('ledger_backup_remote') or ls.get('backup_repo')}; last: {last}")
+            else:
+                warn("the ledger has no backup remote: sealed claims exist only on the server",
+                     "`hyra config set --user ledger_backup_remote <private git URL>`")
         else:
             info("ledger server: not configured (local mode; see `hyra server`)")
 

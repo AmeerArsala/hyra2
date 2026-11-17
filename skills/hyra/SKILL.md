@@ -19,17 +19,22 @@ All durable state lives in `.hyra/` in the research project and is driven by the
 (full reference: [references/cli.md](references/cli.md)). Agent sessions are disposable. Anything
 worth keeping goes into the queue, the Board, memory files, evidence, or Books.
 
-**The CLI:** run `hyra`. If it's not on PATH, run `python3 <this skill's directory>/scripts/hyra`
-instead (or symlink that file onto PATH). Everything below writes `hyra` for short.
+**The CLI:** every command below is `hyra ...`. **First use on a machine:** if `command -v hyra` finds nothing, run
+`python3 <this skill's directory>/scripts/hyra setup --cli` yourself (it only adds a symlink in `~/.local/bin`; tell the user you did),
+then continue with plain `hyra`. Until that works, `python3 <this skill's directory>/scripts/hyra ...` is the same program; it needs
+nothing but Python 3.9+ (the CLI is bundled inside this skill folder).
 
 **Role protocols** (follow the one you're playing; hand them to the agents you dispatch):
 [roles/mission.md](roles/mission.md), [roles/worker.md](roles/worker.md), [roles/reviewer.md](roles/reviewer.md).
 
 ## 1. Orient
-- Run `hyra status`. If it says "not inside a Hyra project", ask the human where the research lives
-  (usually the code repo), `cd` there, and run `hyra init --goal "<one line>"`. Show them
-  `.hyra/config.json`: resource capacities, approval thresholds, and the default `harness` for
-  unattended sessions (set it to the agent CLI they use).
+- Run `hyra status`. If it says "not inside a Hyra project", `cd` into the repo the research is about and run **`hyra init`**
+  (no arguments; it asks nothing). It creates `.hyra/` and connects the project to the user's ledger server if they have one. What the
+  research is for comes from your conversation with the user (step 2), not from init.
+- If init says there's no ledger server, mention it **once**, in two sentences: it's optional, a separate machine that seals worker
+  claims and enforces blind review and approvals, backed up to a private git repo. Deploying puts a service on one of their tailnet
+  machines, so only with an explicit yes: `hyra server up` (it finds a machine and asks for the backup repo). They can run it themselves
+  with `! hyra server up`. Never ask them to paste their human token into chat; their `hyra` commands work without it.
 - First time on a machine or repo, or something misbehaves: `hyra doctor` (what's installed, what actually runs, what to fix);
   `hyra config show|set|validate` for settings.
 - Resuming: `hyra brief overall` shows your memory, inbox, pending approvals, and what changed.

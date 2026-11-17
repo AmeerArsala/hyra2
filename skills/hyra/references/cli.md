@@ -119,8 +119,9 @@ Other config keys: `max_missions_running`, `max_attempts`, `poll_seconds`, `sess
 `settle_grace_seconds`, `resources`. Session logs go to `.hyra/logs/`.
 
 ## Ledger server (optional hardening; see the README)
-`server serve [--data DIR] [--host H] [--port P]` (on the server machine; prints the human and runner tokens once) ·
-`server connect --url URL [--project ID]` (per project) · `server status` · `server token --role overall|mission|worker|reviewer|retrospective [--scope S]`
+`server up [user@host] [--auto] [--dry-run] [--local] [--no-service] [--expose auto|serve|bind|none] [--rotate-tokens]` (deploy over ssh; auto-picks a tailnet device) · `server down [--purge --yes]` · `server where` · `server backup [--init PATH --remote URL] [--repo PATH] [--no-push]` · `server restore --from FILE|REPO --yes` ·
+`server serve [--data DIR] [--host H] [--port P] [--audit-days N]` (on the server machine; prints the human and runner tokens once) ·
+`server connect --url URL [--project ID]` (per project) · `server status` · `server token --role overall|mission|worker|reviewer|retrospective [--scope S] [--ttl-hours N]`
 (needs the human token, from `HYRA_HUMAN_TOKEN` or a prompt; for an interactive session, export the result as `HYRA_TOKEN`).
 In server mode: `task complete` seals the claim on the server (and fails if it can't); `review blind|claim|verdict` and `approval grant|deny`
 are decided by the server; `hyra run` needs `HYRA_RUNNER_TOKEN` and gives each agent its own scoped `HYRA_TOKEN`.
@@ -130,3 +131,5 @@ are decided by the server; `hyra run` needs `HYRA_RUNNER_TOKEN` and gives each a
 `config show` (effective values with their source) · `config set KEY VALUE [--user] [--force]` (JSON or text; dotted keys like `harness_models.opencode`; typos and wrong types refused) ·
 `config unset KEY [--user]` · `config validate` · `config path`. Layers: defaults < `~/.hyra/config.json` < `<project>/.hyra/config.json`.
 `setup --toolkit global|local --agents-only` registers only the named agent files. `server serve ... --no-print-tokens | --rotate-tokens`.
+
+`init` connects the new project to your saved ledger unless `--no-ledger`. Config: `ledger_backup_every_hours` (0 = off; `hyra run` snapshots the ledger into the backup repo this often).

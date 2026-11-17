@@ -3,7 +3,7 @@ name: hyra-loop
 description: Hyra 1.0 recursive improvement loop for performance-driven problems with a computable score (speedups, bounds/constructions, benchmark metrics, heuristics). Runs an autonomous pipeline: a Context Agent keeps a queue of inspirations stocked, parallel Proposal Agents turn them into scored solutions in an isolated sandbox, and an Evaluator Agent can write the first evaluator and upgrade it (bilevel loop). Use when a task or sub-problem can be scored automatically.
 ---
 
-> Requires the `hyra` skill (its CLI: `hyra`, or `python3 <hyra skill dir>/scripts/hyra`).
+> Requires the `hyra` skill. Its CLI is `hyra`; if that is not on PATH yet, follow the hyra skill's first-use step (`setup --cli`).
 
 # Hyra loop (Experience Bank)
 

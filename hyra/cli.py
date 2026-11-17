@@ -52,6 +52,7 @@ def build() -> argparse.ArgumentParser:
     s.add_argument("--agents-only", action="store_true", help="toolkit: only register the named agent files (hyra-worker, ...) for the harnesses that read them; leave skills alone (use after `npx skills add`)")
     s.add_argument("--bin-dir"); s.add_argument("--uninstall", action="store_true")
     s = sub.add_parser("init", help="create .hyra/ in the current directory")
+    s.add_argument("--no-ledger", action="store_true", help="a purely local project: don't connect it to your ledger server")
     s.add_argument("--project", default="")
     s.add_argument("--goal", default="")
 
@@ -179,6 +180,10 @@ def build() -> argparse.ArgumentParser:
     sk.add_parser("list")
     s = sk.add_parser("publish"); s.add_argument("name")
 
+    s = sub.add_parser("session", help="start your coding agent with a ledger token: `hyra session claude` (server mode)")
+    s.add_argument("--role", default="overall", choices=["overall", "mission"]); s.add_argument("--ttl-hours", type=float, default=12)
+    s.add_argument("command", nargs=argparse.REMAINDER, help="the agent command, e.g. claude, codex, omp")
+
     # config and diagnostics
     cf = sub.add_parser("config", help="show / set / validate configuration (defaults < ~/.hyra/config.json < project)").add_subparsers(dest="sub", required=True)
     cf.add_parser("show"); cf.add_parser("validate"); cf.add_parser("path")
@@ -193,10 +198,33 @@ def build() -> argparse.ArgumentParser:
     s.add_argument("--data", default="~/.hyra-server"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=7421)
     s.add_argument("--no-print-tokens", action="store_true", help="write first-run tokens to <data>/initial-tokens.txt only (for services: keeps them out of the journal)")
     s.add_argument("--rotate-tokens", action="store_true", help="revoke the human and runner tokens and mint new ones, then serve")
-    s = sv.add_parser("connect", help="point this project at a ledger"); s.add_argument("--url", required=True); s.add_argument("--project")
+    s.add_argument("--audit-days", type=float, default=180, help="keep the audit trail this long (expired tokens are pruned automatically; claims never are)")
+    s = sv.add_parser("up", help="deploy the ledger to a tailnet device over ssh (auto-picks one) and save the connection")
+    s.add_argument("target", nargs="?", help="user@host; omitted = the one you used before, else auto-select")
+    s.add_argument("--auto", action="store_true", help="re-run auto-selection even if a host was used before")
+    s.add_argument("--local", action="store_true", help="deploy on THIS machine (single-machine setups and tests; agents here share your user)")
+    s.add_argument("--port", type=int, default=7421); s.add_argument("--no-service", action="store_true", help="plain background process instead of systemd/launchd")
+    s.add_argument("--expose", choices=["auto", "serve", "bind", "none"], default="auto", help="serve = tailscale serve HTTPS; bind = tailnet address; none = loopback only")
+    s.add_argument("--rotate-tokens", action="store_true"); s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--backup-remote", metavar="URL", help="private git repo for ledger backups (otherwise asked in a terminal); `none` to skip")
+    s.add_argument("--any-owner", action="store_true", help="auto-select may also pick devices shared with you by other tailnet users")
+    s = sv.add_parser("down", help="stop the ledger over ssh (data kept unless --purge)")
+    s.add_argument("--purge", action="store_true", help="also delete the database on the server"); s.add_argument("--yes", action="store_true")
+    sv.add_parser("where", help="what is deployed, and is it healthy")
+    s = sv.add_parser("backup", help="snapshot the ledger (no tokens) into a git repo and push it")
+    s.add_argument("--repo", help="path of the backup git repo (remembered after the first time)")
+    s.add_argument("--init", metavar="PATH", help="create/clone the backup repo at PATH first"); s.add_argument("--remote", help="with --init: its git remote (use a PRIVATE repo)")
+    s.add_argument("--no-push", action="store_true"); s.add_argument("--quiet", action="store_true")
+    s = sv.add_parser("restore", help="replace the ledger's data with a backup (new tokens are minted)")
+    s.add_argument("--from", dest="src", required=True, help="a ledger.sql file, or a backup repo directory"); s.add_argument("--yes", action="store_true")
+    s = sv.add_parser("dump", help="(on the server) print a token-free SQL snapshot"); s.add_argument("--data", default="~/.hyra-server")
+    s = sv.add_parser("load", help="(on the server) build the ledger database from a dump"); s.add_argument("--data", default="~/.hyra-server")
+    s.add_argument("--file", required=True); s.add_argument("--force", action="store_true")
+    s = sv.add_parser("connect", help="point this project at a ledger (default: the one `server up` deployed)"); s.add_argument("--url"); s.add_argument("--project")
     sv.add_parser("status")
     s = sv.add_parser("token", help="mint a token for an interactive session (needs the human token)")
     s.add_argument("--role", required=True, choices=["overall", "mission", "worker", "reviewer", "retrospective"]); s.add_argument("--scope", default="")
+    s.add_argument("--ttl-hours", type=float, help="token lifetime (default 24h)")
 
     # wiki bridge
     w = sub.add_parser("wiki", help="optional bridge to an llm-obsidian-wiki (Karpathy LLM wiki) vault").add_subparsers(dest="sub", required=True)
@@ -265,10 +293,20 @@ def main(argv=None) -> None:
         pass
 
 
+def load_saved_url() -> str:
+    from .ledger_deploy import load_state
+    url = load_state().get("url")
+    if not url:
+        raise HyraError("no --url given and no ledger deployed from this machine: run `hyra server up`")
+    return url
+
+
 def dispatch(a) -> None:
     if a.cmd == "init":
         st = Store.init(Path.cwd(), a.project or Path.cwd().name, a.goal)
         print(f"initialized Hyra project at {st.dir}\nsee `hyra config show` for what applies; `hyra config set <key> <value>` to change it (resources, approval rules, harness, ...)")
+        from . import onboarding
+        onboarding.init_run(st, a.no_ledger)
         return
     if a.cmd == "setup":
         from .install import setup
@@ -292,6 +330,20 @@ def dispatch(a) -> None:
         books.skill_list(st)
         return
 
+    if a.cmd == "session":
+        cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
+        if not cmd:
+            raise HyraError("usage: hyra session [--role overall] [--ttl-hours 12] <agent command>   e.g. hyra session claude")
+        from . import remote
+        env = {k: v for k, v in os.environ.items() if k not in ("HYRA_HUMAN_TOKEN", "HYRA_RUNNER_TOKEN")}
+        try:
+            st0 = Store(find_root())
+        except HyraError:
+            st0 = None
+        if st0 and remote.enabled(st0):
+            env["HYRA_TOKEN"] = remote.mint_for_human(st0, a.role, "", a.ttl_hours)
+            print(f"hyra: starting {cmd[0]} with a {a.role} ledger token valid for {a.ttl_hours:g}h", file=sys.stderr)
+        os.execvpe(cmd[0], cmd, env)
     if a.cmd in ("doctor", "config"):  # work with or without a project
         from . import doctor as dr
         try:
@@ -311,9 +363,50 @@ def dispatch(a) -> None:
         else:
             print(f"user:    {dr.user_config_path()}\nproject: {root / '.hyra' / 'config.json' if root else '(not in a project)'}")
         return
+    if a.cmd == "server" and a.sub in ("dump", "load"):
+        from .server import dump_sql, restore_sql
+        if a.sub == "dump":
+            sys.stdout.write(dump_sql(a.data))
+        else:
+            print(restore_sql(a.data, a.file, a.force))
+        return
+    if a.cmd == "server" and a.sub in ("backup", "restore"):
+        from . import ledger_deploy as ld
+        if a.sub == "backup":
+            ld.backup(a.repo, a.init, a.remote, not a.no_push, quiet=a.quiet)
+        else:
+            ld.restore(a.src, a.yes)
+        return
+    if a.cmd == "server" and a.sub in ("down", "where"):
+        from . import ledger_deploy as ld
+        ld.down(a.purge, a.yes) if a.sub == "down" else ld.where()
+        return
+    if a.cmd == "server" and a.sub == "up":
+        from . import ledger_deploy as ld
+        from . import doctor as dr
+        pref = list(dr._read(dr.user_config_path()).get("ledger_hosts", []))
+        try:
+            proot = find_root()
+            pref += dr._read(proot / ".hyra" / "config.json").get("ledger_hosts", [])
+        except HyraError:
+            proot = None
+        res = ld.up("local" if a.local else a.target, auto=a.auto, port=a.port, use_service=not a.no_service, rotate=a.rotate_tokens,
+                    expose=a.expose, dry_run=a.dry_run, preferred=pref, any_owner=a.any_owner)
+        if res and not a.dry_run:
+            from . import onboarding
+            onboarding.after_up(a.backup_remote)
+        if res and proot and not a.dry_run:
+            st0 = Store(proot)
+            cfg_path = st0.dir / "config.json"
+            cfg = json.loads(cfg_path.read_text())
+            import uuid
+            cfg["server"] = {"url": res["url"], "project": (cfg.get("server") or {}).get("project") or uuid.uuid4().hex}
+            cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+            print(f"connected this project ({proot.name}) to the ledger")
+        return
     if a.cmd == "server" and a.sub == "serve":
         from .server import serve
-        serve(a.data, a.host, a.port, a.no_print_tokens, a.rotate_tokens)
+        serve(a.data, a.host, a.port, a.no_print_tokens, a.rotate_tokens, a.audit_days)
         return
     st = Store.open()
     agent = core.me()
@@ -419,7 +512,8 @@ def dispatch(a) -> None:
             import uuid
             cfg_path = st.dir / "config.json"
             cfg = json.loads(cfg_path.read_text())
-            cfg["server"] = {"url": a.url.rstrip("/"), "project": a.project or (cfg.get("server") or {}).get("project") or uuid.uuid4().hex}
+            url = a.url or load_saved_url()
+            cfg["server"] = {"url": url.rstrip("/"), "project": a.project or (cfg.get("server") or {}).get("project") or uuid.uuid4().hex}
             cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
             st.config["server"] = cfg["server"]
             print(f"project connected to {cfg['server']['url']} as project {cfg['server']['project']}: {remote.call(st, 'GET', '/v1/health')}")
@@ -430,7 +524,7 @@ def dispatch(a) -> None:
             if remote.enabled(st):
                 print(f"health: {remote.call(st, 'GET', '/v1/health')}")
         elif s == "token":
-            print(remote.mint_for_human(st, a.role, a.scope))
+            print(remote.mint_for_human(st, a.role, a.scope, a.ttl_hours))
     elif c == "wiki":
         if s == "setup":
             wiki.setup(st, a.vault, a.cluster)

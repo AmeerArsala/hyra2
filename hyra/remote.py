@@ -35,6 +35,10 @@ def _cfg(st: Store) -> dict:
 def call(st: Store, method: str, path: str, body: Optional[dict] = None, token: Optional[str] = None) -> Any:
     cfg = _cfg(st)
     tok = token or os.environ.get("HYRA_TOKEN") or os.environ.get("HYRA_RUNNER_TOKEN") or os.environ.get("HYRA_HUMAN_TOKEN")
+    if not tok and sys.stdin.isatty():  # you, at a terminal, reading approvals
+        tok = _saved().get("human_token")
+    if not tok:
+        tok = _ambient_overall_token(cfg)  # the interactive agent (Overall) with no token of its own
     req = urllib.request.Request(cfg["url"].rstrip("/") + path, method=method,
                                  data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Authorization": f"Bearer {tok or ''}", "X-Hyra-Project": cfg["project"],
@@ -47,17 +51,62 @@ def call(st: Store, method: str, path: str, body: Optional[dict] = None, token: 
             msg = json.loads(e.read()).get("error", "")
         except Exception:
             msg = ""
-        raise HyraError(f"ledger server refused ({e.code}): {msg}")
+        hint = ""
+        if e.code == 401 and not tok:
+            hint = " (this shell has no ledger token: start your agent with `hyra session <agent command>`, e.g. `hyra session claude`)"
+        raise HyraError(f"ledger server refused ({e.code}): {msg}{hint}")
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise HyraError(f"ledger server unreachable at {cfg['url']}: {e}. Failing closed (nothing was recorded).")
+
+
+def _saved() -> dict:
+    """Connection and tokens written by `hyra server up` (~/.hyra/ledger.json, mode 600)."""
+    try:
+        from .ledger_deploy import load_state
+        return load_state()
+    except Exception:
+        return {}
+
+
+def _ambient_overall_token(cfg: dict) -> Optional[str]:
+    """The interactive agent is Overall; with no token in its environment it uses a short-lived `overall` token minted from the
+    saved runner token (cached in ~/.hyra/ledger.json). Agent sessions launched by the scheduler always carry their own scoped
+    token and a role in HYRA_ROLE, so they never get here: a worker or reviewer without a token is refused, not upgraded."""
+    if os.environ.get("HYRA_ROLE") not in (None, "", "overall"):
+        return None
+    try:
+        from .ledger_deploy import _age_seconds, datetime_now_iso, load_state, save_state, state_path
+        from datetime import datetime, timedelta, timezone
+        s = load_state()
+        if not s.get("runner_token") or s.get("url", "").rstrip("/") != cfg["url"].rstrip("/"):
+            return None
+        if s.get("overall_token") and _age_seconds(s.get("overall_expires")) < -1800:  # more than 30 min of life left
+            return s["overall_token"]
+        req = urllib.request.Request(cfg["url"].rstrip("/") + "/v1/token", method="POST",
+                                     data=json.dumps({"role": "overall", "ttl_hours": 4}).encode(),
+                                     headers={"Authorization": f"Bearer {s['runner_token']}", "X-Hyra-Project": cfg["project"],
+                                              "Content-Type": "application/json"})
+        tok = json.loads(urllib.request.urlopen(req, timeout=15).read())["token"]
+        s["overall_token"] = tok
+        s["overall_expires"] = (datetime.now(timezone.utc) + timedelta(hours=4)).replace(microsecond=0).isoformat()
+        save_state(s)
+        return tok
+    except Exception:
+        return None
+
+
+def runner_token() -> Optional[str]:
+    """The scheduler's token. Only the scheduler process uses the saved copy (and strips it from every agent session)."""
+    return os.environ.get("HYRA_RUNNER_TOKEN") or _saved().get("runner_token")
 
 
 def human_token() -> str:
     tok = os.environ.get("HYRA_HUMAN_TOKEN")
     if tok:
         return tok
-    if sys.stdin.isatty():
-        return getpass.getpass("human token: ")
+    if sys.stdin.isatty():  # a real terminal: you. An agent's shell tool is never a tty, so it can't use the saved copy this way.
+        saved = _saved().get("human_token")
+        return saved or getpass.getpass("human token: ")
     raise HyraError("deciding approvals needs the human token: run in a terminal (you'll be prompted) or set HYRA_HUMAN_TOKEN")
 
 
@@ -111,11 +160,14 @@ def approval_decide(st: Store, remote_id: int, grant: bool, by: str, note: str) 
 
 # ---- sessions -----------------------------------------------------------------------------------------------------
 def mint_session_token(st: Store, role: str, scope: str = "") -> str:
-    tok = os.environ.get("HYRA_RUNNER_TOKEN")
+    tok = runner_token()
     if not tok:
-        raise HyraError("server mode: the scheduler needs HYRA_RUNNER_TOKEN (printed when `hyra server serve` first ran)")
+        raise HyraError("server mode: the scheduler needs the runner token (set HYRA_RUNNER_TOKEN, or `hyra server up` saves it)")
     return call(st, "POST", "/v1/token", {"role": role, "scope": scope}, token=tok)["token"]
 
 
-def mint_for_human(st: Store, role: str, scope: str = "") -> str:
-    return call(st, "POST", "/v1/token", {"role": role, "scope": scope}, token=human_token())["token"]
+def mint_for_human(st: Store, role: str, scope: str = "", ttl_hours: Optional[float] = None) -> str:
+    body: dict = {"role": role, "scope": scope}
+    if ttl_hours is not None:
+        body["ttl_hours"] = ttl_hours
+    return call(st, "POST", "/v1/token", body, token=human_token())["token"]

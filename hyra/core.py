@@ -98,6 +98,7 @@ def mission_wake(st: Store, slug: str, when: Optional[str], reason: str, until_f
 
 
 def mission_close(st: Store, slug: str, conclusion: str, accept_unreviewed: bool) -> None:
+    _maybe_backup(st)
     st.mission(slug)
     unreviewed = st.q("""SELECT id, title FROM tasks WHERE mission=? AND status='done'
                          AND kind IN ('experiment','analysis','build') AND review_verdict IS NULL""", slug)
@@ -629,6 +630,7 @@ def approval_list(st: Store, show_all: bool) -> None:
 
 
 def approval_decide(st: Store, aid: int, grant: bool, by: str, note: str) -> None:
+    _maybe_backup(st)
     if role() in WORKER_ROLES:
         raise HyraError("agents cannot decide approvals; only the human (via Overall) can")
     if st.config.get("approvals_require_tty") and not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -826,6 +828,8 @@ def memory_show(st: Store, agent: str, node: Optional[str] = None) -> None:
 
 def brief(st: Store, agent: str, mark: bool = True) -> None:
     """Everything an agent needs on wake-up, without replaying a long session."""
+    if agent == "overall":
+        _maybe_backup(st)
     state = st.one("SELECT * FROM agent_state WHERE agent=?", agent)
     last = state["last_board_id"] if state else 0
     print(f"# Briefing for {agent} @ {now()}\n")
@@ -880,7 +884,13 @@ def brief(st: Store, agent: str, mark: bool = True) -> None:
              agent, top, now())
 
 
+def _maybe_backup(st: Store) -> None:
+    from . import ledger_deploy
+    ledger_deploy.maybe_backup(st.config)
+
+
 def status(st: Store) -> None:
+    _maybe_backup(st)
     cfg = st.config
     print(f"# Hyra project: {cfg.get('project') or st.root.name}  ({st.root})")
     if cfg.get("goal"):

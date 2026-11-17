@@ -23,16 +23,24 @@ class E2E(unittest.TestCase):
         self.env["CLAUDE_CONFIG_DIR"] = str(Path(self.tmp.name) / "claude-home")  # no hyra agents installed
         fake = Path(self.tmp.name) / "fakehome"  # tests must never see (or touch) the real home's installed agents
         fake.mkdir()
-        self.env.update(HOME=str(fake), XDG_CONFIG_HOME=str(fake / ".config"), KIMI_CODE_HOME=str(fake / ".kimi-code"))
+        self.env.update(HOME=str(fake), XDG_CONFIG_HOME=str(fake / ".config"), KIMI_CODE_HOME=str(fake / ".kimi-code"),
+                        HYRA_TAILSCALE_BIN="")  # tests never look at (or probe) the real tailnet
         for k in ("HYRA_AGENT", "HYRA_ROLE", "HYRA_TASK", "HYRA_PROJECT"):
             self.env.pop(k, None)
 
     def tearDown(self):
+        for fn in reversed(getattr(self, "pre_cleanup", [])):  # things that need the temp dirs to still exist (stop servers, ...)
+            try:
+                fn()
+            except Exception:
+                pass
         self.tmp.cleanup()
 
     def h(self, *args, ok=True, env=None):
         p = subprocess.run([sys.executable, HYRA, *args], cwd=self.root, capture_output=True, text=True,
                            env=dict(self.env, **(env or {})))
+        if ok is None:
+            return p.stdout + p.stderr
         if ok and p.returncode != 0:
             self.fail(f"hyra {' '.join(args)} failed:\n{p.stdout}\n{p.stderr}")
         if not ok:
@@ -597,7 +605,13 @@ esac
         def serve(*flags):  # start, wait for the tokens line, stop
             p = subprocess.Popen([sys.executable, HYRA, "server", "serve", "--data", str(data), "--port", "0", *flags],
                                  stdout=subprocess.PIPE, text=True, env=self.env)
-            time.sleep(1.5); p.terminate(); out = p.stdout.read(); p.wait(); return out
+            lines = []
+            for line in p.stdout:  # wait for the real "listening" line instead of guessing a delay (a loaded machine is slower)
+                lines.append(line)
+                if "listening" in line:
+                    break
+            p.terminate(); p.wait()
+            return "".join(lines)
         out = serve("--no-print-tokens")
         toks = (data / "initial-tokens.txt").read_text()
         human1 = [l for l in toks.split() if l.startswith("HYRA_HUMAN_TOKEN=")][0].split("=")[1]
@@ -613,6 +627,259 @@ esac
         h = lambda t: hashlib.sha256(t.encode()).hexdigest()
         self.assertEqual(db.execute("select revoked from tokens where hash=?", (h(human1),)).fetchone()[0], 1)
         self.assertEqual(db.execute("select revoked from tokens where hash=?", (h(human2),)).fetchone()[0], 0)
+
+    def test_ledger_cleans_up_after_itself(self):
+        """Session tokens expire, housekeeping prunes dead tokens and old audit rows, and research data is never auto-deleted."""
+        sys.path.insert(0, str(Path(HYRA).resolve().parents[3]))
+        from hyra.server import Ledger
+        import sqlite3
+        led = Ledger(Path(self.tmp.name) / "l")
+        worker = led.mint("worker", "p", "1", ttl_hours=24)
+        dead = led.mint("worker", "p", "2", ttl_hours=-48)                   # expired two days ago
+        forever = led.mint("human")
+        self.assertIsNotNone(led.whoami(worker)); self.assertIsNone(led.whoami(dead)); self.assertIsNotNone(led.whoami(forever))
+        self.assertIsNotNone(led.one("SELECT expires FROM tokens WHERE hash=?", __import__("hashlib").sha256(worker.encode()).hexdigest())["expires"])
+        self.assertIsNone(led.one("SELECT expires FROM tokens WHERE hash=?", __import__("hashlib").sha256(forever.encode()).hexdigest())["expires"])
+        led.x("INSERT INTO audit VALUES (?,?,?,?,?)", "2020-01-01T00:00:00+00:00", "p", "worker", "seal", "T1")     # ancient
+        led.x("INSERT INTO audit VALUES (?,?,?,?,?)", "2999-01-01T00:00:00+00:00", "p", "worker", "seal", "T2")     # recent
+        led.x("INSERT INTO claims VALUES (?,?,?,?,?,?)", "p", 1, "the research record", "f", "worker", "2020-01-01T00:00:00+00:00")
+        led.x("INSERT INTO approvals(project,kind,what,status,created) VALUES ('p','compute','x','granted','2020-01-01T00:00:00+00:00')")
+        before = led.stats()
+        led.prune(audit_days=180)
+        after = led.stats()
+        self.assertEqual(after["tokens_total"], before["tokens_total"] - 1)     # only the long-dead token went
+        self.assertEqual(after["audit_rows"], before["audit_rows"] - 1)         # only the ancient audit row went
+        self.assertEqual((after["claims"], after["approvals"]), (1, 1))         # the research record is untouched
+        self.assertIsNone(led.whoami(dead)); self.assertIsNotNone(led.whoami(worker))
+        # ledgers created before expiry existed are upgraded in place
+        old = sqlite3.connect(Path(self.tmp.name) / "old.db")
+        old.executescript("CREATE TABLE tokens (hash TEXT PRIMARY KEY, role TEXT, project TEXT, scope TEXT, created TEXT, revoked INTEGER DEFAULT 0);")
+        old.commit(); old.close()
+        Path(self.tmp.name, "oldl").mkdir(); (Path(self.tmp.name) / "old.db").rename(Path(self.tmp.name) / "oldl" / "ledger.db")
+        Ledger(Path(self.tmp.name) / "oldl")
+        cols = [r[1] for r in sqlite3.connect(Path(self.tmp.name) / "oldl" / "ledger.db").execute("PRAGMA table_info(tokens)")]
+        self.assertIn("expires", cols)
+
+    def _wait_for(self, fn, timeout=20):
+        end = time.time() + timeout
+        while time.time() < end:
+            v = fn()
+            if v:
+                return v
+            time.sleep(0.2)
+        return None
+
+    def test_init_generates_config_and_never_deploys_from_an_agent_shell(self):
+        home = Path(self.env["HOME"])
+        out = self.h("init")                                                          # no terminal: nothing is asked or deployed
+        ucfg = home / ".hyra/config.json"
+        self.assertTrue(ucfg.exists())                                                  # generated silently
+        cfg = json.loads(ucfg.read_text())
+        self.assertEqual((cfg["ledger_backup_every_hours"], cfg["ledger_backup_remote"], cfg["ledger_hosts"]), (6, "", []))
+        self.assertNotIn("server", json.loads((self.root / ".hyra/config.json").read_text()))
+        self.assertIn("optional: `hyra server up`", out)                                # one line, no questions
+        self.assertRegex(self.h("config", "show"), r"ledger_backup_every_hours\s+\[user\s*\] 6")
+        cfg["ledger_hosts"] = ["me@box"]; ucfg.write_text(json.dumps(cfg))
+        p2 = Path(self.tmp.name) / "again"; p2.mkdir()
+        subprocess.run([sys.executable, HYRA, "init"], cwd=p2, capture_output=True, env=self.env)
+        self.assertEqual(json.loads(ucfg.read_text())["ledger_hosts"], ["me@box"])    # a second init never overwrites your settings
+
+    def test_home_directory_is_never_mistaken_for_a_project(self):
+        """~/.hyra (machine-wide settings) looks like a project's .hyra/. Found live: `hyra server up` from a folder under the home
+        directory treated the home directory as the project, crashed, and left a stray database in ~/.hyra."""
+        self.pre_cleanup = [lambda: self.h("server", "down", "--purge", "--yes", ok=None)]
+        home = Path(self.env["HOME"])
+        (home / ".hyra").mkdir(exist_ok=True); (home / ".hyra/config.json").write_text("{}")
+        work = home / "Projects" / "not-a-project"; work.mkdir(parents=True)
+        run = lambda *a: subprocess.run([sys.executable, HYRA, *a], cwd=work, capture_output=True, text=True, env=self.env)
+        r = run("status")
+        self.assertNotEqual(r.returncode, 0); self.assertIn("not inside a Hyra project", r.stderr)
+        self.assertIn("not inside a Hyra project", run("doctor").stdout)
+        r = subprocess.run([sys.executable, HYRA, "init"], cwd=home, capture_output=True, text=True, env=self.env)
+        self.assertNotEqual(r.returncode, 0); self.assertIn("home directory", r.stderr)         # and init refuses to make it one
+        r = run("server", "up", "--local", "--no-service", "--expose", "none")                 # the exact command that crashed
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(sorted(p.name for p in (home / ".hyra").glob("hyra.db*")), [])         # no stray database, ever
+
+    def test_server_up_sets_up_backups_and_init_connects(self):
+        import socket
+        self.pre_cleanup = [lambda: self.h("server", "down", "--purge", "--yes", ok=None)]
+        bare = Path(self.tmp.name) / "remote.git"; subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+        out = self.h("server", "up", "--local", "--no-service", "--expose", "none", "--backup-remote", str(bare))
+        self.assertIn("ledger is up", out); self.assertIn("backups now run by themselves", out)
+        self.assertIn("connected to your ledger server", self.h("init"))                # init needs no flags to connect
+        self.assertEqual(json.loads((Path(self.env["HOME"]) / ".hyra/config.json").read_text())["ledger_backup_remote"], str(bare))
+        clone = Path(self.tmp.name) / "c"; subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True)
+        self.assertTrue((clone / "ledger.sql").exists())                               # the first snapshot already reached the remote
+        self.assertNotIn("TABLE tokens", (clone / "ledger.sql").read_text())
+
+    def test_server_up_asks_for_the_backup_remote_in_a_real_terminal(self):
+        import pty
+        self.pre_cleanup = [lambda: self.h("server", "down", "--purge", "--yes", ok=None)]
+        bare = Path(self.tmp.name) / "remote.git"; subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+        import select
+        m, sl = pty.openpty()
+        p = subprocess.Popen([sys.executable, HYRA, "server", "up", "--local", "--no-service", "--expose", "none"], cwd=self.root,
+                             stdin=sl, stdout=sl, stderr=sl, env=self.env)
+        out, answered, end = "", False, time.time() + 60
+        while time.time() < end:  # behave like a person: read until the question appears, then type the answer
+            if select.select([m], [], [], 0.2)[0]:
+                try:
+                    out += os.read(m, 4096).decode(errors="replace")
+                except OSError:
+                    break
+            if not answered and "blank to skip" in out:
+                os.write(m, (str(bare) + "\n").encode()); answered = True
+            if p.poll() is not None and not select.select([m], [], [], 0.3)[0]:
+                break
+        p.wait(timeout=30); os.close(sl); os.close(m)
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("Git remote to back the ledger up to", out)
+        self.assertEqual(json.loads((Path(self.env["HOME"]) / ".hyra/config.json").read_text())["ledger_backup_remote"], str(bare))
+        proj = Path(self.tmp.name) / "p-after"; proj.mkdir()                              # and later projects connect with a bare `init`
+        r = subprocess.run([sys.executable, HYRA, "init"], cwd=proj, capture_output=True, text=True, env=self.env)
+        self.assertIn("connected to your ledger server", r.stdout)
+        self.assertIn("server", json.loads((proj / ".hyra/config.json").read_text()))
+
+    def test_interactive_agent_needs_no_token_ceremony_but_sessions_are_not_upgraded(self):
+        self.pre_cleanup = [lambda: self.h("server", "down", "--purge", "--yes", ok=None)]
+        self.h("server", "up", "--local", "--no-service", "--expose", "none")
+        self.h("init")
+        sf = Path(self.env["HOME"]) / ".hyra/ledger.json"
+        st = json.loads(sf.read_text())
+        f = self.root / "r.txt"; f.write_text("x")
+        self.h("mission", "new", "m1", "--title", "t", "--problem", "p")
+        for _ in range(2):
+            self.h("task", "add", "--mission", "m1", "--title", "a", "--spec", "s")
+        self.h("task", "next", "--worker", "w", env={"HYRA_RUNNER_TOKEN": st["runner_token"]})
+        self.h("task", "next", "--worker", "w", env={"HYRA_RUNNER_TOKEN": st["runner_token"]})
+        # a scheduler-launched worker/reviewer that somehow has no token is refused, never quietly upgraded to Overall
+        out = self.h("task", "complete", "2", "--summary", "x", "--evidence", str(f), ok=False, env={"HYRA_ROLE": "worker", "HYRA_TASK": "2"})
+        self.assertIn("hyra session", out)
+        self.assertNotIn("overall_token", json.loads(sf.read_text()))                       # nothing was minted for it
+        # the interactive agent (default role) just works: a short-lived overall token is minted behind the scenes and cached
+        self.h("task", "complete", "1", "--summary", "interactive claim", "--evidence", str(f))
+        cached = json.loads(sf.read_text())
+        self.assertTrue(cached["overall_token"].startswith("hyra_overall_"))
+        self.assertIn("interactive claim", self.h("task", "show", "1"))                      # and can read it back
+        self.h("task", "complete", "2", "--summary", "second", "--evidence", str(f))
+        self.assertEqual(json.loads(sf.read_text())["overall_token"], cached["overall_token"])   # reused, not re-minted each command
+        # `hyra session <agent>` is still there for anyone who wants an explicit token
+        shown = self.h("session", "--", "sh", "-c", 'echo "tok=$(echo $HYRA_TOKEN | cut -d_ -f2) human=${HYRA_HUMAN_TOKEN:-absent} runner=${HYRA_RUNNER_TOKEN:-absent}"',
+                       env={"HYRA_HUMAN_TOKEN": st["human_token"]})
+        self.assertIn("tok=overall human=absent runner=absent", shown)
+        self.h("session", ok=False)
+
+    def test_routine_overall_commands_trigger_a_due_backup(self):
+        self.pre_cleanup = [lambda: self.h("server", "down", "--purge", "--yes", ok=None)]
+        bare = Path(self.tmp.name) / "remote.git"; subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+        self.h("server", "up", "--local", "--no-service", "--expose", "none", "--backup-remote", str(bare))
+        self.h("init")
+        sf = Path(self.env["HOME"]) / ".hyra/ledger.json"
+        for how in (("status",), ("brief", "overall")):                                  # no scheduler running: just using the agent
+            s = json.loads(sf.read_text()); s["last_backup"] = "2020-01-01T00:00:00+00:00"; s.pop("last_backup_attempt", None)
+            sf.write_text(json.dumps(s))
+            self.h(*how)
+            self.assertTrue(self._wait_for(lambda: json.loads(sf.read_text()).get("last_backup", "") > "2026-01-01"), how)
+        s = json.loads(sf.read_text()); s["last_backup"] = "2020-01-01T00:00:00+00:00"; sf.write_text(json.dumps(s))
+        self.h("status")                                                                # attempted a moment ago: backs off, doesn't hammer
+        time.sleep(1.5)
+        self.assertEqual(json.loads(sf.read_text())["last_backup"], "2020-01-01T00:00:00+00:00")
+        cfgp = Path(self.env["HOME"]) / ".hyra/config.json"                            # and it can be switched off
+        c = json.loads(cfgp.read_text()); c["ledger_backup_every_hours"] = 0; cfgp.write_text(json.dumps(c))
+        s = json.loads(sf.read_text()); s.pop("last_backup_attempt", None); sf.write_text(json.dumps(s))
+        self.h("status"); time.sleep(1.5)
+        self.assertEqual(json.loads(sf.read_text())["last_backup"], "2020-01-01T00:00:00+00:00")
+
+    def test_ledger_dump_and_restore_roundtrip(self):
+        sys.path.insert(0, str(Path(HYRA).resolve().parents[3]))
+        from hyra.server import Ledger, dump_sql, restore_sql
+        d1 = Path(self.tmp.name) / "l1"
+        led = Ledger(d1)
+        led.mint("human"); led.mint("worker", "p", "1", ttl_hours=24)
+        led.x("INSERT INTO claims VALUES (?,?,?,?,?,?)", "p", 1, "the sealed conclusion", "f", "worker", "2026-01-01T00:00:00+00:00")
+        led.x("INSERT INTO approvals(project,kind,what,status,created) VALUES ('p','compute','run it','granted','2026-01-01T00:00:00+00:00')")
+        sql = dump_sql(str(d1))
+        self.assertIn("the sealed conclusion", sql)
+        self.assertNotIn("hyra_", sql); self.assertNotIn('"tokens"', sql); self.assertNotIn("TABLE tokens", sql)   # no tokens, not even hashes
+        f = Path(self.tmp.name) / "dump.sql"; f.write_text(sql)
+        d2 = Path(self.tmp.name) / "l2"
+        self.assertEqual(restore_sql(str(d2), str(f)), "restored 1 claims, 0 reviews, 1 approvals")
+        led2 = Ledger(d2)
+        self.assertEqual(led2.one("SELECT summary FROM claims")[0], "the sealed conclusion")
+        self.assertEqual(led2.one("SELECT COUNT(*) FROM tokens")[0], 0)            # fresh tokens will be minted on first serve
+        with self.assertRaises(SystemExit):
+            restore_sql(str(d2), str(f))                                           # won't silently overwrite a ledger with data
+        restore_sql(str(d2), str(f), force=True)
+        self.assertTrue(list(d2.glob("ledger.db.before-restore-*")))              # ...and the old one is kept aside
+
+    def test_ledger_backup_restore_cycle_and_init_autoconnect(self):
+        import socket
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        self.pre_cleanup = [lambda: self.h("server", "down", "--purge", "--yes", ok=None)]
+        home = Path(self.env["HOME"])
+        # 1. init auto-connects a project to a ledger you already deployed
+        self.h("init")
+        self.assertNotIn("server", json.loads((self.root / ".hyra/config.json").read_text()))   # no ledger yet: local project
+        self.h("server", "up", "--local", "--no-service", "--expose", "none", "--port", str(port))
+        proj2 = Path(self.tmp.name) / "proj2"; proj2.mkdir()
+        run2 = lambda *a, ok=True: subprocess.run([sys.executable, HYRA, *a], cwd=proj2, capture_output=True, text=True, env=self.env)
+        out = run2("init")
+        self.assertIn("connected to your ledger server", out.stdout)
+        c2 = json.loads((proj2 / ".hyra/config.json").read_text())["server"]
+        self.assertEqual(c2["url"], f"http://127.0.0.1:{port}"); self.assertEqual(len(c2["project"]), 32)
+        proj3 = Path(self.tmp.name) / "proj3"; proj3.mkdir()
+        out3 = subprocess.run([sys.executable, HYRA, "init", "--no-ledger"], cwd=proj3, capture_output=True, text=True, env=self.env)
+        self.assertNotIn("server", json.loads((proj3 / ".hyra/config.json").read_text()))            # opt-out
+        # 2. a sealed claim in that project, then back the ledger up into a git repo with a (local, bare) remote
+        st = json.loads((home / ".hyra/ledger.json").read_text())
+        H = {"HYRA_HUMAN_TOKEN": st["human_token"]}
+        tok = lambda role, scope="": subprocess.run([sys.executable, HYRA, "server", "token", "--role", role, "--scope", scope], cwd=proj2,
+                                                     capture_output=True, text=True, env=dict(self.env, **H)).stdout.strip()
+        e = lambda **k: dict(self.env, **k)
+        r = lambda *a, env=None: subprocess.run([sys.executable, HYRA, *a], cwd=proj2, capture_output=True, text=True, env=env or self.env)
+        r("mission", "new", "m1", "--title", "t", "--problem", "p"); r("task", "add", "--mission", "m1", "--title", "a", "--spec", "s")
+        r("task", "next", "--worker", "w", env=e(HYRA_RUNNER_TOKEN=st["runner_token"]))
+        (proj2 / "r.txt").write_text("x")
+        done = r("task", "complete", "1", "--summary", "UNIQUE-SEALED-CONCLUSION-77", "--evidence", str(proj2 / "r.txt"), env=e(HYRA_TOKEN=tok("worker", "1")))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        bare = Path(self.tmp.name) / "remote.git"; subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+        repo = Path(self.tmp.name) / "backup-repo"
+        self.assertIn("no backup repo yet", self.h("server", "backup", ok=False))
+        out = self.h("server", "backup", "--init", str(repo), "--remote", str(bare))
+        self.assertIn("committed", out); self.assertIn("pushed", out)
+        sql = (repo / "ledger.sql").read_text()
+        self.assertIn("UNIQUE-SEALED-CONCLUSION-77", sql)                                 # the claims are in the backup...
+        self.assertNotIn(st["human_token"], sql); self.assertNotIn(st["runner_token"], sql); self.assertNotIn("TABLE tokens", sql)   # ...the tokens are not
+        clone = Path(self.tmp.name) / "verify-clone"; subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True)
+        self.assertIn("UNIQUE-SEALED-CONCLUSION-77", (clone / "ledger.sql").read_text())    # it really reached the remote
+        self.assertIn("no changes", self.h("server", "backup"))                              # idempotent
+        # 3. the scheduler backs up on its own when asked to
+        u = Path(self.env["HOME"]) / ".hyra/config.json"
+        self.h("config", "set", "--user", "ledger_backup_every_hours", "1")
+        sf = home / ".hyra/ledger.json"
+        stt = json.loads(sf.read_text()); stt["last_backup"] = "2020-01-01T00:00:00+00:00"; sf.write_text(json.dumps(stt))   # long overdue
+        self.h("run", "--once", "--max-workers", "0")
+        fired = self._wait_for(lambda: json.loads(sf.read_text()).get("last_backup", "") > "2026-01-01" and json.loads(sf.read_text())["last_backup"])
+        self.assertTrue(fired, "the scheduler never took a snapshot")                       # it did, in the background
+        self.h("run", "--once", "--max-workers", "0")
+        time.sleep(1.5)
+        self.assertEqual(json.loads(sf.read_text())["last_backup"], fired)                   # and not again within the hour
+        # 4. disaster recovery: the ledger is destroyed, redeployed empty, and restored from the git repo
+        self.h("server", "down", "--purge", "--yes")
+        self.assertFalse((home / ".hyra-server").exists())
+        self.h("server", "up", "--local", "--no-service", "--expose", "none", "--port", str(port))
+        self.assertIn("--yes", self.h("server", "restore", "--from", str(repo), ok=False))
+        out = self.h("server", "restore", "--from", str(repo), "--yes")
+        self.assertIn("restored 1 claims", out)
+        st2 = json.loads((home / ".hyra/ledger.json").read_text())
+        self.assertNotEqual(st2["human_token"], st["human_token"])                           # new tokens after a restore
+        mission2 = subprocess.run([sys.executable, HYRA, "server", "token", "--role", "mission"], cwd=proj2, capture_output=True, text=True,
+                                  env=e(HYRA_HUMAN_TOKEN=st2["human_token"])).stdout.strip()
+        shown = r("task", "show", "1", env=e(HYRA_TOKEN=mission2)).stdout
+        self.assertIn("UNIQUE-SEALED-CONCLUSION-77", shown)                                  # the project still reads its sealed claim
+
 
     def test_scheduler_mints_scoped_tokens_and_strips_privileged_ones(self):
         human, runner = self._start_ledger()
@@ -633,6 +900,107 @@ echo ok > r.txt; hyra task complete $HYRA_TASK --summary "SEALED-BY-SESSION" --e
         # Codex's sandbox has no network, so in server mode it is given network access (to reach the ledger) and only then
         self.h("task", "add", "--mission", "m1", "--title", "b", "--spec", "s")
         self.assertIn("network_access=true", self.h("run", "--dry-run", "--task", "2", "--harness", "codex", env={"HYRA_RUNNER_TOKEN": runner}))
+
+
+    def _ld(self):
+        sys.path.insert(0, str(Path(HYRA).resolve().parents[3]))
+        from hyra import ledger_deploy
+        return ledger_deploy
+
+    def test_ledger_auto_selection_matches_the_shape_of_a_real_tailnet(self):
+        ld = self._ld()
+        me = {"ID": "n1", "UserID": 1, "HostName": "macbook", "OS": "macOS"}
+        peers = {f"n{i}": {"ID": f"n{i}", "UserID": u, "HostName": h, "DNSName": f"{h}.tail.ts.net.", "OS": os_, "Online": on,
+                           "TailscaleIPs": [f"100.0.0.{i}"]}
+                 for i, (h, os_, on, u) in enumerate([("APOTHEOSIS", "linux", True, 1), ("phone", "android", True, 1),
+                                                       ("offline-box", "linux", False, 1), ("friends-box", "linux", True, 2),
+                                                       ("zed-mac", "macOS", True, 1), ("blend", "linux", True, 1),
+                                                       ("windows-pc", "windows", True, 1), ("iphone", "iOS", True, 1)], start=2)}
+        names = lambda c: [x["host"] for x in c]
+        got = ld.candidates({"Self": me, "Peer": peers}, [])
+        self.assertEqual(names(got), ["APOTHEOSIS", "blend", "zed-mac"])        # Linux before macOS; no phones/windows/offline/other owners/self
+        self.assertEqual(names(ld.candidates({"Self": me, "Peer": peers}, [], any_owner=True))[:3], ["APOTHEOSIS", "blend", "friends-box"])
+        got = ld.candidates({"Self": me, "Peer": peers}, ["isagi@zed-mac", "nitez@blend"])  # your own list wins, with your usernames
+        self.assertEqual(names(got)[:2], ["blend", "zed-mac"])
+        self.assertEqual([c["target"] for c in got][:2], ["nitez@blend", "isagi@zed-mac"])
+        self.assertIn("ssh nitez@box", ld.ssh_failure_hint("Host key verification failed.", "nitez@box"))
+        self.assertIn("wrong user", ld.ssh_failure_hint("Permission denied (publickey)", "nitez@box"))
+
+    def test_service_definitions(self):
+        ld = self._ld()
+        unit = ld.systemd_unit(["/usr/bin/python3", "/home/u/.hyra-server/hyra.pyz", "server", "serve", "--host", "127.0.0.1"])
+        for needle in ("ExecStart=/usr/bin/python3 /home/u/.hyra-server/hyra.pyz server serve", "Restart=on-failure", "UMask=0077",
+                       "NoNewPrivileges=yes", "WantedBy=default.target"):
+            self.assertIn(needle, unit)
+        plist = ld.launchd_plist("com.hyra.ledger", ["/usr/bin/python3", "/Users/u/.hyra-server/hyra.pyz", "server", "serve"], "/Users/u/.hyra-server")
+        for needle in ("<key>Label</key><string>com.hyra.ledger</string>", "<key>KeepAlive</key><true/>", "<string>serve</string>", "ledger.log"):
+            self.assertIn(needle, plist)
+        import plistlib; plistlib.loads(plist.encode())                           # valid property list
+
+    def test_ledger_deploy_lifecycle_on_this_machine(self):
+        """`hyra server up/where/down` end to end (here: 'local' target, plain process, loopback), then a sealed claim via saved tokens."""
+        import socket
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        self.pre_cleanup = [lambda: self.h("server", "down", "--purge", "--yes", ok=None)]
+        self.h("init")
+        self.h("server", "up", "--dry-run", "--local")
+        out = self.h("server", "up", "--local", "--no-service", "--expose", "none", "--port", str(port))
+        self.assertIn("ledger is up", out)
+        self.assertIn("connected this project", out)                              # inside a project, it connects it
+        state_file = Path(self.env["HOME"]) / ".hyra/ledger.json"
+        self.assertEqual(oct(state_file.stat().st_mode & 0o777), "0o600")
+        st = json.loads(state_file.read_text())
+        self.assertTrue(st["human_token"].startswith("hyra_human_") and st["runner_token"].startswith("hyra_runner_"))
+        self.assertFalse((Path(self.env["HOME"]) / ".hyra-server/initial-tokens.txt").exists())   # token file removed from the server
+        self.assertIn("healthy: True", self.h("server", "where"))
+        self.assertIn("up", self.h("server", "up", "--local", "--no-service", "--expose", "none", "--port", str(port)))   # idempotent
+        self.assertEqual(json.loads(state_file.read_text())["human_token"], st["human_token"])    # same tokens after a re-run
+        # the scheduler needs no exported token: it uses the saved runner token, and strips tokens from the agents it launches
+        script = 'echo ok > r.txt; hyra task complete $HYRA_TASK --summary "SEALED-VIA-SAVED-TOKEN" --evidence r.txt'
+        cfg = json.loads((self.root / ".hyra/config.json").read_text())
+        cfg.update(harness="fake", harness_cmds={"fake": ["bash", "-c", script, "{prompt}"]}, max_missions_running=0, overall_agent=False, auto_retro=False)
+        (self.root / ".hyra/config.json").write_text(json.dumps(cfg))
+        self.h("mission", "new", "m1", "--title", "t", "--problem", "p")
+        self.h("task", "add", "--mission", "m1", "--title", "a", "--spec", "s")
+        self.h("run", "--once")
+        self.assertIn("[done]", self.h("task", "show", "1"))
+        raw = b"".join(p.read_bytes() for p in (self.root / ".hyra").glob("hyra.db*"))
+        self.assertNotIn(b"SEALED-VIA-SAVED-TOKEN", raw)
+        # the saved HUMAN token is only usable from a real terminal: an agent's shell (pipes) can't use it
+        mission = self.h("server", "token", "--role", "mission", env={"HYRA_HUMAN_TOKEN": st["human_token"]}).strip()
+        cfg = json.loads((self.root / ".hyra/config.json").read_text()); cfg["resources"] = {"workers": 4, "gpu": 2}
+        (self.root / ".hyra/config.json").write_text(json.dumps(cfg))
+        self.h("task", "add", "--mission", "m1", "--title", "gpu", "--spec", "s", "--resource", "gpu=1", env={"HYRA_TOKEN": mission})
+        self.assertNotIn("granted", self.h("approval", "grant", "1", ok=False))   # pipes: no token, refused
+        import pty, os as _os
+        m, sl = pty.openpty()
+        p = subprocess.Popen([sys.executable, HYRA, "approval", "grant", "1"], cwd=self.root, stdin=sl, stdout=sl, stderr=sl, env=self.env)
+        p.wait(timeout=30); _os.close(sl)
+        self.assertEqual(p.returncode, 0)                                         # a terminal: the saved token is used
+        # down keeps data; --purge needs --yes
+        self.assertIn("data kept", self.h("server", "down"))
+        self.assertIn("healthy: False", self.h("server", "where"))
+        self.assertIn("--yes", self.h("server", "down", "--purge", ok=False))
+        self.h("server", "up", "--local", "--no-service", "--expose", "none", "--port", str(port))
+        self.assertEqual(json.loads(state_file.read_text())["human_token"], st["human_token"])    # data (and tokens) survived
+        self.assertIn("deleted", self.h("server", "down", "--purge", "--yes"))
+        self.assertFalse(state_file.exists())
+        self.assertFalse((Path(self.env["HOME"]) / ".hyra-server").exists())
+
+    def test_ledger_as_a_real_os_service(self):
+        """Gated: starts a real launchd/systemd user service on THIS machine (unique name, removed afterwards)."""
+        if not os.environ.get("HYRA_TEST_SERVICE"):
+            self.skipTest("set HYRA_TEST_SERVICE=1 to start (and remove) a real launchd/systemd user service")
+        if sys.platform != "darwin" and not shutil.which("systemctl"):
+            self.skipTest("no launchd/systemd here")
+        import socket, uuid
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        tag = uuid.uuid4().hex[:8]
+        env = {"HYRA_LEDGER_LABEL": f"com.hyra.ledger.test{tag}", "HYRA_LEDGER_UNIT": f"hyra-ledger-test{tag}"}
+        self.pre_cleanup = [lambda: self.h("server", "down", "--purge", "--yes", ok=None, env=env)]
+        out = self.h("server", "up", "--local", "--expose", "none", "--port", str(port), env=env)
+        self.assertRegex(out, r"launchd|systemd")
+        self.assertIn("healthy: True", self.h("server", "where", env=env))
 
 
     def test_runner_requeues_dead_worker(self):

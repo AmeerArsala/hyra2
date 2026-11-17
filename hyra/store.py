@@ -46,6 +46,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_retro": True,          # a closed mission with no retro Board entry gets a retrospective session
     "auto_check_tasks": True,    # narrower/refuted review verdicts queue a task that turns the flaw into an automated check
     "approvals_require_tty": False,   # if true, `approval grant|deny` only works from a real terminal (agent shells aren't ttys)
+    "ledger_hosts": [],          # your tailnet machines as user@host; `hyra server up` tries these first (set once, usually with --user)
+    # Ledger backups (only when a ledger is deployed and a backup remote/repo is set): a background snapshot is started by `hyra run`
+    # and by Overall-side commands (status, brief, mission close, approvals) whenever one is due. 0 turns it off.
+    "ledger_backup_every_hours": 6,
+    "ledger_backup_remote": "",       # a PRIVATE git remote URL for the snapshots (hyra init asks for it)
     "notify_cmd": "",            # shell command run (env HYRA_NOTIFY_TEXT) when a message for the human arrives, e.g. ntfy/osascript
     # Optional llm-obsidian-wiki vault (see hyra/wiki.py): {"vault": "/path", "cluster": "hyra"}.
     "wiki": {},
@@ -177,16 +182,27 @@ def library_root() -> Path:
     return Path(os.environ.get("HYRA_LIBRARY", Path.home() / ".hyra" / "library"))
 
 
+def is_project(p: Path) -> bool:
+    """A project's .hyra/ holds hyra.db. Your home directory's ~/.hyra/ (machine-wide config, ledger connection, library) has the
+    same name but is never a project, so a stray `hyra status` anywhere under your home can't create state there."""
+    try:
+        if p.resolve() == Path.home().resolve():
+            return False
+    except OSError:
+        pass
+    return (p / HYRA_DIR / "hyra.db").is_file()
+
+
 def find_root(start: Optional[Path] = None) -> Path:
     env = os.environ.get("HYRA_PROJECT")
     if env:
         p = Path(env).expanduser().resolve()
-        if (p / HYRA_DIR).is_dir():
+        if is_project(p):
             return p
-        raise HyraError(f"HYRA_PROJECT={env} has no {HYRA_DIR}/ directory")
+        raise HyraError(f"HYRA_PROJECT={env} is not a Hyra project (no {HYRA_DIR}/hyra.db)")
     cur = (start or Path.cwd()).resolve()
     for p in [cur, *cur.parents]:
-        if (p / HYRA_DIR).is_dir():
+        if is_project(p):
             return p
     raise HyraError("not inside a Hyra project (no .hyra/ found). Run `hyra init` first.")
 
@@ -221,6 +237,8 @@ class Store:
     # ---- construction -------------------------------------------------
     @classmethod
     def init(cls, root: Path, project: str, goal: str) -> "Store":
+        if root.resolve() == Path.home().resolve():
+            raise HyraError("refusing to create a project in your home directory (~/.hyra is for machine-wide settings): cd into a repo first")
         d = root / HYRA_DIR
         for sub in ["memory", "books", "skills", "evidence", "eb", "logs"]:
             (d / sub).mkdir(parents=True, exist_ok=True)

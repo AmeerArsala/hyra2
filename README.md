@@ -42,23 +42,28 @@ under `hyra/`, run `python3 scripts/build_bundle.py`; a test fails if the bundle
 
 ### On a fresh repo or machine (e.g. via skills.sh)
 
-`npx skills add <owner>/<repo>` (all skills) copies the skill folders; that is **enough to start**, because the bundle makes the
-CLI work as `python3 <skill dir>/scripts/hyra` with only Python 3.9+. What's left, all optional except 1 and 3:
+`npx skills add <owner>/<repo>` (all skills) copies the skill folders, and **that's all you do**. skills.sh has no post-install hook,
+so the skill handles the rest itself on first use: the agent runs `setup --cli` (one symlink in `~/.local/bin`) and tells you. The CLI
+is bundled in the skill folder, so the only requirement is Python 3.9+. Everything else is optional:
 
 | | what | how |
 |---|---|---|
-| 1 | `hyra` on your PATH (skills call it by that name) | `python3 ~/.agents/skills/hyra/scripts/hyra setup --cli` (adjust the path to where the skills landed) |
-| 2 | named agents (`hyra-worker`, ...) for harnesses that read agent files | `hyra setup --toolkit global --agents-only`. Skippable: without them the roles are embedded in each prompt, which is what was verified live on Codex |
-| 3 | an agent CLI installed and logged in, for unattended runs | `hyra doctor` lists which are usable; `hyra config set harness <name>` |
-| 4 | per research repo | `hyra init` (the agent does this when you ask for research); machine-wide preferences go in `~/.hyra/config.json` via `hyra config set --user ...` |
-| 5 | wiki | the `hyra-wiki` scripts need `bash`, `git`, `python3`; web capture also wants `defuddle-cli`, `trafilatura`, `yt-dlp` |
-| 6 | ledger server, phone pings | [`docs/self-hosting.md`](docs/self-hosting.md) |
+| 1 | an agent CLI installed and logged in, for unattended runs (`hyra run`) | `hyra doctor` lists which work; `hyra config set harness <name>` |
+| 2 | per research repo | `hyra init` (the agent does this when you ask for research) |
+| 3 | a ledger server, for hard blind-review and approval boundaries | `hyra server up` (it finds a tailnet device and deploys it for you; see below) |
+| 4 | phone pings | [`docs/self-hosting.md`](docs/self-hosting.md) |
+| 5 | wiki web capture | `defuddle-cli`, `trafilatura`, `yt-dlp` (the wiki scripts need `bash`, `git`, `python3`) |
+| 6 | "named agents" | **skip this.** Some tools (Claude Code, OpenCode, Antigravity, omp) let you save helper agents as files so a chat can say "use hyra-worker". `hyra setup --toolkit global --agents-only` writes those files. Without them hyra pastes the same instructions into each prompt, which works everywhere and is what was tested most |
 
 Run **`hyra doctor`** anywhere: it checks Python, the CLI on PATH, the skills in every harness's folder, which agent CLIs actually run
 (not just exist on PATH), the scoring sandbox, and, inside a project, config problems, the ledger server and tokens, and says what to do.
 **`hyra config show|set|unset|validate`** manages the layers (built-in defaults < `~/.hyra/config.json` < `<project>/.hyra/config.json`) and
-catches typos (`overal_agent` is rejected with "did you mean `overall_agent`?"). `hyra init` writes only the project's name and goal, so
+catches typos (`overal_agent` is rejected with "did you mean `overall_agent`?"). `hyra init` writes only the project's name (and the ledger connection), so
 your machine-wide settings aren't silently overridden.
+
+## Quick start
+
+The whole flow is three commands: `cd my-repo`, add the skills, `hyra init`; then talk to your agent. Details: **[docs/guide.md](docs/guide.md)**.
 
 ## Use
 
@@ -186,31 +191,80 @@ Claude subagents can't spawn subagents, so an *interactive* Claude session can't
 
 ## Server mode (optional hardening)
 
-A small ledger server (`hyra server serve`, stdlib only) that you run on **another machine**, e.g. a device on your tailnet,
-and point projects at with `hyra server connect --url http://<host>:7421`. Then:
+The ledger is **one SQLite file behind a small stdlib HTTP process** (`hyra server serve`), so putting it somewhere is just: copy one
+self-contained file, run it as a service, reach it over the tailnet. `hyra server up` does all of that over ssh, on any Linux or macOS
+device on your tailnet; you don't have to think about the machine:
+
+```bash
+hyra server up                    # picks a device for you (never this one), deploys, saves the connection, connects this project
+hyra server up nitez@APOTHEOSIS  # or name one (the username can differ per machine)
+hyra server where                 # what's deployed, and is it healthy
+hyra server down                  # stop it over ssh (data kept);  --purge --yes also deletes it
+hyra config set --user ledger_hosts '["noctezeta@blend","nitez@APOTHEOSIS","isagi@fedora"]'   # once: your machines and usernames
+```
+**Auto-selection:** your `ledger_hosts` first, then online Linux devices owned by you (before macOS laptops), then macOS; phones, Windows,
+offline machines, devices shared by other tailnet users, and this machine are skipped. Each candidate is probed over ssh (`BatchMode`,
+strict host keys, so an unseen host is skipped with "run `ssh user@host` once to trust it", never trusted silently).
+`hyra server up --dry-run` shows the choice without changing anything. **On the target:** `systemd --user` (Linux) or launchd (macOS)
+keeps it running, else a background process; it's published with `tailscale serve` (HTTPS, real certificate) when allowed, otherwise
+bound to the tailnet address. First-run tokens are read over ssh once, deleted from the server, and saved in `~/.hyra/ledger.json`
+(mode 600): the **runner** token is used only by the scheduler (no exported variable needed, and it's stripped from every agent session)
+and the **human** token only from a real terminal. No container is needed; an always-on Linux machine is the better host (a Mac
+LaunchAgent only runs while you're logged in).
+
+What it enforces once a project is connected:
 - **Worker claims are sealed on the server.** The project's database holds only a marker (checked down to the WAL file).
 - **Blind review is enforced by the server.** A reviewer's token can't fetch the claim until it has recorded its blind assessment;
   verdicts are immutable; the server keeps an audit trail (seal, read, blind, reveal, verdict).
 - **Approvals are decided only with the human token.** The scheduler asks the server before running anything that needed approval,
   so editing the local database can't release gated work.
-- **Each agent session gets its own scoped token**, minted by the scheduler (needs `HYRA_RUNNER_TOKEN`); privileged tokens are stripped
-  from every agent's environment. It fails closed: if the server is unreachable, completing a task is refused.
+- **Each agent session gets its own scoped token**, minted by the scheduler. It fails closed: if the server is unreachable, completing a
+  task is refused.
 
-```bash
-# on the server machine (bind to its tailnet address, not 0.0.0.0):
-hyra server serve --data ~/.hyra-server --host $(tailscale ip -4) --port 7421     # prints the human + runner tokens once
-# in each project:
-hyra server connect --url http://<server>:7421
-HYRA_RUNNER_TOKEN=... hyra run                       # the scheduler
-HYRA_HUMAN_TOKEN=... hyra approval grant 3           # or omit the variable and type it at the prompt
-hyra server token --role overall                     # a token for an interactive session (needs the human token)
-```
-Tested live over a tailnet (omp worker and omp blind reviewer on a Mac, ledger on a Linux box): the audit trail showed the seal, then
-the reviewer's blind assessment, *then* the claim reveal; an early read was refused through the CLI and the raw API. Codex needs
-network access to reach the ledger, which the runner grants it only when a ledger is configured.
-**What it doesn't stop:** an agent that hunts for credentials in its parent processes, and the worker's raw session log (`.hyra/logs/`)
-and execution notes, which stay local and can contain its conclusion. It makes the secrets unreachable by touching files, not by a determined attacker.
-It's not needed for agents that follow instructions; it's defense in depth. Deploying it on a tailnet device (systemd user service + `tailscale serve`, no container needed): [`docs/self-hosting.md`](docs/self-hosting.md).
+Tested live over a tailnet (omp worker and omp blind reviewer on this Mac, ledger on a Linux box): the audit trail showed the seal, then
+the reviewer's blind assessment, *then* the claim reveal; an early read was refused through the CLI and the raw API. Codex needs network
+access to reach the ledger, which the runner grants it only when a ledger is configured. For the deployer itself: auto-selection was run
+(dry run) against a real tailnet, the full up/where/down lifecycle runs on one machine, and the launchd service was started and removed
+for real; the **systemd and `tailscale serve` steps on a remote machine are written and unit-tested but have not been run for real yet**.
+**What it doesn't stop:** an agent that hunts for credentials (the saved tokens file, parent processes), and the worker's raw session log
+(`.hyra/logs/`) and execution notes, which stay local and can contain its conclusion. It makes the secrets unreachable by touching the
+project's files, not by a determined attacker. It's not needed for agents that follow instructions; it's defense in depth.
+**Why it has to be another machine.** Your agents run on this computer as you, so anything stored here, even in a hidden folder, is readable
+by them: the sealed claims, the approval ledger and the human token included. On a different machine those sit behind a network
+boundary: an agent needs a credential to reach them, not just a file path. That is what closes the blind-review gap (an agent can't
+open a file to read the claim) and the approval gap. A project stays tied to its ledger (its sealed claims live only there), so use the
+same one over time; many projects can share it. **New repos connect automatically:** `hyra init` connects to the ledger you deployed
+(`hyra init --no-ledger` for a purely local project; if the ledger is unreachable it says so and the project is local).
+
+**What it serves:** not files. It answers a small JSON API over HTTP (health, tokens, claims, reviews, approvals, stats) and applies the rules
+(who may read what, in which order). The only state is one SQLite file on the server; clients never download it.
+**Housekeeping (automatic):** session tokens expire after 24 hours (`hyra server token --ttl-hours N` for a longer interactive session; the
+scheduler's per-agent tokens are minted fresh each session); every 6 hours the server drops long-expired tokens and audit rows older than 180
+days (`--audit-days`); it keeps no request log. **Never deleted automatically:** sealed claims, reviews and approvals, which are your research
+record and tiny (on the order of a few KB per task). `hyra server where` shows the size and counts.
+
+**Best practices.**
+- **Bring it up once, not per repo.** One ledger serves all your projects (each is partitioned by its own id). Run `hyra server up` once per
+  tailnet; every `hyra init` after that connects the new repo by itself. Re-run `hyra server up` only to upgrade it after updating hyra
+  (it copies the new bundle, restarts, and keeps the data and tokens) or to move it.
+- **Use it where the guarantees matter**: unattended multi-day runs, real compute approvals, results others will rely on. For quick or
+  exploratory repos, local mode (no ledger) is simpler and fine.
+- **Host it on an always-on Linux machine** you can ssh into; list your machines once in `ledger_hosts`.
+- **Stay on the tailnet while a connected project is active.** If the ledger is unreachable, completing a task is refused (it fails closed,
+  nothing is recorded). Don't disconnect a project that has sealed claims: their text lives only on the server.
+- **Back it up to a git repo** (it's the only copy of the sealed claims). Make a **private** repo, then once:
+  `hyra server backup --init ~/hyra-ledger-backup --remote git@github.com:you/hyra-ledger-backup.git`, and afterwards just
+  `hyra server backup` (commit + push; "no changes" if nothing happened). To make `hyra run` do it for you:
+  `hyra config set --user ledger_backup_every_hours 6`. The snapshot is taken on the server with SQLite's online backup (consistent
+  while it runs; copying the live file isn't), written as SQL text so git can diff and compress it, and **leaves out the tokens**.
+  The repo contains your research conclusions in plain text, so keep it private.
+- **Restore** (new machine, lost disk): `hyra server up` (an empty ledger is fine), then `hyra server restore --from ~/hyra-ledger-backup --yes`.
+  It replaces the data (the old database is kept aside on the server), mints **new** tokens and saves them; projects keep their ids and
+  read their sealed claims again. Moving the ledger to another host is the same: `hyra server down`, `hyra server up user@newhost`, restore.
+- **If a token leaks:** `hyra server up --rotate-tokens`. Treat `~/.hyra/ledger.json` like an ssh key.
+
+To deploy to a specific machine: `hyra server up noctezeta@blend` (that's the whole command; run it in your terminal, or `! hyra server up noctezeta@blend` inside an agent session).
+Manual setup instead of `hyra server up`: [`docs/self-hosting.md`](docs/self-hosting.md).
 
 ## Phone notifications
 

@@ -11,6 +11,11 @@ with a real certificate, so nothing is exposed to your LAN or the internet and e
 
 ## 1. The ledger server
 
+**The easy way: `hyra server up`.** It does everything in this section for you over ssh (copy the bundle, install a `systemd --user`
+or launchd service, publish with `tailscale serve` or bind to the tailnet address, collect the tokens and delete them from the server)
+and can pick the machine itself. See the README's "Server mode". What follows is the same thing by hand, for when you want to see
+or change what it does.
+
 **Do you need a container? No.** It is one stdlib Python file (the `hyra.pyz` bundle) and one SQLite file. A container adds an image
 to maintain and no protection: the thing you're guarding against is an agent on your *Mac*, and the ledger is already on another
 machine, reachable only with a token. A `systemd --user` service is the simplest thing that restarts on failure and survives reboots.

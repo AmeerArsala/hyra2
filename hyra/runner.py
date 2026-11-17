@@ -107,8 +107,11 @@ class Runner:
         self.agent_of: dict[int, str] = {}  # pid -> agent id of every live session
         if max_workers is not None:
             st.config.setdefault("resources", {})["workers"] = max_workers
-        if remote.enabled(st) and not dry_run and not os.environ.get("HYRA_RUNNER_TOKEN"):
-            raise HyraError("server mode: start the scheduler with HYRA_RUNNER_TOKEN set (it mints each agent's scoped token)")
+        if remote.enabled(st) and not dry_run:
+            tok = remote.runner_token()
+            if not tok:
+                raise HyraError("server mode: the scheduler needs the runner token (HYRA_RUNNER_TOKEN, or run `hyra server up` which saves it)")
+            os.environ["HYRA_RUNNER_TOKEN"] = tok  # this process only; stripped from every agent session in _launch
 
     # -------------------------------------------------------------- launching
     def _launch(self, agent_id: str, role: str, header: str, model: Optional[str], harness: Optional[str],
@@ -290,6 +293,11 @@ class Runner:
                 out.append(slug)
         return out
 
+    def maybe_backup_ledger(self) -> None:
+        if not self.dry:
+            from . import ledger_deploy as ld
+            ld.maybe_backup(self.st.config)
+
     def notify_humans(self) -> None:
         cmd = self.st.config.get("notify_cmd")
         if not cmd or self.dry:
@@ -323,6 +331,7 @@ class Runner:
                          MISSION_PROMPT.format(slug=slug, root=self.st.root, reason=reason), None, None, None, slug)
             live_missions += 1
         self.notify_humans()
+        self.maybe_backup_ledger()
         reason = self.overall_reason()
         if reason:
             self._launch("overall", "overseer", OVERALL_PROMPT.format(root=self.st.root, reason=reason), None, None, None, None)
