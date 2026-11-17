@@ -1,6 +1,6 @@
 ---
 name: audit
-description: This skill should be used when wiki-curator needs to perform a read-only health check of the vault, scanning for orphans, stale pages, source drift, contradictions, and tree-topology violations. Triggers on "audit wiki", "check health", "find issues", "wiki diagnostic".
+description: "This skill should be used when wiki-curator needs to perform a read-only health check of the vault, scanning for orphans, stale pages, source drift, contradictions, and tree-topology violations. Triggers on \"audit wiki\", \"check health\", \"find issues\", \"wiki diagnostic\"."
 ---
 
 # Audit — Wiki Health Check (Read-Only)

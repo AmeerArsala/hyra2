@@ -1,6 +1,6 @@
 ---
 name: capture
-description: This skill should be used when an agent needs to ingest a source (URL, YouTube, GitHub, PDF, clipboard, session log) into the vault. Triggers when wiki-scribe or wiki-researcher needs to "capture", "save source", "intake", "file URL", or "hash and store".
+description: "This skill should be used when an agent needs to ingest a source (URL, YouTube, GitHub, PDF, clipboard, session log) into the vault. Triggers when wiki-scribe or wiki-researcher needs to \"capture\", \"save source\", \"intake\", \"file URL\", or \"hash and store\"."
 ---
 
 # Capture — Universal Source Intake

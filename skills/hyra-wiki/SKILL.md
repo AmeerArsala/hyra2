@@ -1,7 +1,7 @@
 ---
 name: hyra-wiki
-description: Karpathy-style LLM wiki (an Obsidian-compatible markdown vault an agent compiles and maintains: raw sources, typed cited pages, confidence, supersession) for any agent harness. Four roles: researcher (web to cited pages), scribe (verbatim capture of URL/PDF/text), advisor (answers only from the wiki, with [[wikilinks]]), curator (audit, fix, migrate). Use for "research X into the wiki", "save this URL/PDF", "what does the wiki say about X", "clean up the wiki", or to scaffold a vault. Optional companion to hyra; vendored from MIT-licensed llm-obsidian-wiki.
-compatibility: Any Agent Skills harness with a shell (Claude Code, Codex, Antigravity, OpenCode, Pi/omp, Cursor, Amp, ...). Needs bash, git, python3. Optional capture tools - defuddle-cli (npm), trafilatura (uv/pip), yt-dlp, a PDF-to-text tool.
+description: "Karpathy-style LLM wiki (an Obsidian-compatible markdown vault an agent compiles and maintains: raw sources, typed cited pages, confidence, supersession) for any agent harness. Four roles: researcher (web to cited pages), scribe (verbatim capture of URL/PDF/text), advisor (answers only from the wiki, with [[wikilinks]]), curator (audit, fix, migrate). Use for \"research X into the wiki\", \"save this URL/PDF\", \"what does the wiki say about X\", \"clean up the wiki\", or to scaffold a vault. Optional companion to hyra; vendored from MIT-licensed llm-obsidian-wiki."
+compatibility: "Any Agent Skills harness with a shell (Claude Code, Codex, Antigravity, OpenCode, Pi/omp, Cursor, Amp, ...). Needs bash, git, python3. Optional capture tools - defuddle-cli (npm), trafilatura (uv/pip), yt-dlp, a PDF-to-text tool."
 ---
 
 # hyra-wiki: an LLM-maintained knowledge vault

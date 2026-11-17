@@ -1,6 +1,6 @@
 ---
 name: migrate
-description: Use when wiki-curator needs to upgrade a vault's schema_version to the latest supported version. Triggers on "migrate wiki", "upgrade schema", "apply migration v0.X → v0.Y".
+description: "Use when wiki-curator needs to upgrade a vault's schema_version to the latest supported version. Triggers on \"migrate wiki\", \"upgrade schema\", \"apply migration v0.X → v0.Y\"."
 ---
 
 # Migrate — Schema Upgrade

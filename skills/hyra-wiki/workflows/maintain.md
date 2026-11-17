@@ -1,6 +1,6 @@
 ---
 name: maintain
-description: This skill should be used when wiki-curator needs to apply auto-fixes for structural violations (orphans, missing fields, hot.md updates) and propose semantic fixes (contradictions, supersession, hub splits) with user confirmation. Triggers on "fix wiki issues", "auto-resolve", "split hubs", "promote drafts", "update hot.md".
+description: "This skill should be used when wiki-curator needs to apply auto-fixes for structural violations (orphans, missing fields, hot.md updates) and propose semantic fixes (contradictions, supersession, hub splits) with user confirmation. Triggers on \"fix wiki issues\", \"auto-resolve\", \"split hubs\", \"promote drafts\", \"update hot.md\"."
 ---
 
 # Maintain — Proactive Wiki Hygiene (Write)

@@ -1,7 +1,7 @@
 ---
 name: hyra
-description: Run long-horizon, evidence-gated agentic research with the Hyra 2.0 harness (Overall → Mission → Worker, persistent task queue, Research Board, blind independent review, tiered Books knowledge, skill distillation). Use when the user wants to start, resume, or check on a research project, run experiments over many sessions, build or improve a research tool/model/workflow, or says "hyra".
-compatibility: Works in any Agent Skills harness with a shell (Claude Code, Codex, Antigravity, OpenCode, Kimi Code, omp/Pi, Cursor, Amp, ...). Needs python3 >= 3.9; no packages. Unattended mode drives a headless agent CLI (claude, codex, agy, kimi, omp, pi, opencode, amp, or a custom command).
+description: "Run long-horizon, evidence-gated agentic research with the Hyra 2.0 harness (Overall → Mission → Worker, persistent task queue, Research Board, blind independent review, tiered Books knowledge, skill distillation). Use when the user wants to start, resume, or check on a research project, run experiments over many sessions, build or improve a research tool/model/workflow, or says \"hyra\"."
+compatibility: "Works in any Agent Skills harness with a shell (Claude Code, Codex, Antigravity, OpenCode, Kimi Code, omp/Pi, Cursor, Amp, ...). Needs python3 >= 3.9; no packages. Unattended mode drives a headless agent CLI (claude, codex, agy, kimi, omp, pi, opencode, amp, or a custom command)."
 ---
 
 # Hyra 2.0 — Overall

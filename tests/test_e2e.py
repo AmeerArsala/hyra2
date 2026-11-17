@@ -1450,5 +1450,27 @@ echo ok > r.txt; hyra task complete $HYRA_TASK --summary "SEALED-BY-SESSION" --e
             self.assertEqual(p.returncode, 0, f"{t.name}\n{p.stdout[-400:]}{p.stderr[-400:]}")
 
 
+class SkillFrontmatter(unittest.TestCase):
+    """The skills CLI parses frontmatter with a strict YAML parser and silently drops skills it rejects (an unquoted
+    `description: a: b` is a nested-mapping error), so a naive parser here would hide that."""
+
+    def test_every_skill_and_role_frontmatter_is_strict_yaml(self):
+        skills = Path(__file__).resolve().parent.parent / "skills"
+        files = [p for p in skills.rglob("*.md") if "templates" not in p.parts and p.read_text(encoding="utf-8").startswith("---\n")]
+        self.assertGreaterEqual(len(files), 5)
+        for f in files:
+            head = f.read_text(encoding="utf-8")[4:].split("\n---", 1)[0]
+            for line in head.splitlines():
+                m = re.match(r"^[A-Za-z][\w-]*:\s+(.*)$", line)
+                if not m or m.group(1)[:1] in "\"'|>[{":
+                    continue
+                v = m.group(1)
+                self.assertFalse(": " in v or " #" in v or v.endswith(":") or v[:1] in "&*!%@`", f"{f}: quote this value: {line[:70]}")
+            if f.name == "SKILL.md":
+                self.assertIn(f"name: {f.parent.name}", head)
+                desc = json.loads(re.search(r"^description:\s+(\".*\")$", head, re.M).group(1))
+                self.assertLessEqual(len(desc), 1024, f)
+
+
 if __name__ == "__main__":
     unittest.main()

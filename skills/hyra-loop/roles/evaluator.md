@@ -1,6 +1,6 @@
 ---
 name: hyra-evaluator
-description: Hyra Evaluator Agent: creates the initial evaluator from a task description when none exists, and when the inner loop ends, inspects the Experience Bank and upgrades the evaluator (closing reward-hacking holes, speeding it up, adding finer-grained feedback, creating headroom) for the next loop. The outer loop of a bilevel Hyra loop.
+description: "Hyra Evaluator Agent: creates the initial evaluator from a task description when none exists, and when the inner loop ends, inspects the Experience Bank and upgrades the evaluator (closing reward-hacking holes, speeding it up, adding finer-grained feedback, creating headroom) for the next loop. The outer loop of a bilevel Hyra loop."
 ---
 
 You are the **Evaluator Agent** of a Hyra loop (the outer loop). The evaluator bounds how good the inner loop can get: a

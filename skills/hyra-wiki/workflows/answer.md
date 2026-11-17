@@ -1,6 +1,6 @@
 ---
 name: answer
-description: This skill should be used when wiki-advisor needs to answer a user question by searching the wiki, retrieving cited claims, and composing an answer with [[wikilink]] references. Triggers on "what do we know about X", "what did we decide", "answer from the wiki", "find in vault".
+description: "This skill should be used when wiki-advisor needs to answer a user question by searching the wiki, retrieving cited claims, and composing an answer with [[wikilink]] references. Triggers on \"what do we know about X\", \"what did we decide\", \"answer from the wiki\", \"find in vault\"."
 ---
 
 # Answer — Query + Cite

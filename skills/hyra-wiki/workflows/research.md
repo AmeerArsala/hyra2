@@ -1,6 +1,6 @@
 ---
 name: research
-description: This skill should be used when wiki-researcher needs to investigate a topic from scratch with web search, capture multiple sources, identify concepts, write cross-linked wiki pages with confidence scoring, and detect contradictions with existing knowledge. Triggers on "research X", "investigate Y", "build a write-up about Z", "compile knowledge on W".
+description: "This skill should be used when wiki-researcher needs to investigate a topic from scratch with web search, capture multiple sources, identify concepts, write cross-linked wiki pages with confidence scoring, and detect contradictions with existing knowledge. Triggers on \"research X\", \"investigate Y\", \"build a write-up about Z\", \"compile knowledge on W\"."
 ---
 
 # Research — Outbound Discovery + Synthesis Loop

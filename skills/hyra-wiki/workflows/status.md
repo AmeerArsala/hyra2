@@ -1,6 +1,6 @@
 ---
 name: status
-description: Print wiki metrics (page counts by type, unprocessed sources, last-modified, schema version)
+description: "Print wiki metrics (page counts by type, unprocessed sources, last-modified, schema version)"
 ---
 
 Print quick wiki metrics.

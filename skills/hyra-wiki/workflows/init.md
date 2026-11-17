@@ -1,6 +1,6 @@
 ---
 name: init
-description: Bootstrap a brand-new LLM Wiki vault: directory tree, wiki.config.md, index/hot/log, .gitignore, and agent instructions (AGENTS.md + CLAUDE.md). Triggers on "init wiki", "create new vault", "scaffold knowledge base".
+description: "Bootstrap a brand-new LLM Wiki vault: directory tree, wiki.config.md, index/hot/log, .gitignore, and agent instructions (AGENTS.md + CLAUDE.md). Triggers on \"init wiki\", \"create new vault\", \"scaffold knowledge base\"."
 ---
 
 # Init — Vault Scaffold

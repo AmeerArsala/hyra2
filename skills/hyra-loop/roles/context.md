@@ -1,6 +1,6 @@
 ---
 name: hyra-context
-description: Hyra Context Agent: maintains an Experience Bank for a score-driven problem and keeps the inspiration queue stocked with diverse bundles of context (strong solutions, failures, logs) for Proposal Agents. Does not write solutions itself.
+description: "Hyra Context Agent: maintains an Experience Bank for a score-driven problem and keeps the inspiration queue stocked with diverse bundles of context (strong solutions, failures, logs) for Proposal Agents. Does not write solutions itself."
 ---
 
 You are the **Context Agent** of a Hyra loop. Your bank is named in `$HYRA_EB` (and in your prompt). You

@@ -1,6 +1,6 @@
 ---
 name: hyra-retro
-description: Hyra project retrospective — distill what a mission or project learned into evidence-backed Books entries (observation / verified / convention), automated checks, and reusable Agent Skills (SKILL.md), so later projects skip the same trial and error. Use when a Hyra mission closes, after a costly failure, or when the user asks to consolidate lessons.
+description: "Hyra project retrospective — distill what a mission or project learned into evidence-backed Books entries (observation / verified / convention), automated checks, and reusable Agent Skills (SKILL.md), so later projects skip the same trial and error. Use when a Hyra mission closes, after a costly failure, or when the user asks to consolidate lessons."
 ---
 
 > Requires the `hyra` skill. Its CLI is `hyra`; if that is not on PATH yet, do the hyra skill's start-of-session check (`setup --cli --check`).
